@@ -49,6 +49,7 @@ class GameBot:
         wait_time=60,
         quick_exit=False,
         background_mode=True,
+        match_log_enabled=False,
     ):
         self.running = True
         self.hotkey_listener = None
@@ -96,6 +97,12 @@ class GameBot:
         self.mode = mode
 
         self.template_cache = {}
+        # 匹配诊断日志：记录模板匹配分数，便于排查"UI改版导致模板失配"类问题。
+        # 由 GUI 复选框控制，默认关闭，避免日常运行时产生大量日志。
+        self.match_log_enabled = match_log_enabled
+        self._match_log_state = {}      # {模板名: (状态桶, 上次打印时间)}
+        self.MATCH_LOG_INTERVAL = 20    # 同一模板状态不变时的最短重复间隔(秒)
+        self.MATCH_LOG_NEAR = 0.28      # 低于阈值但在该范围内记为"接近阈值"(重点诊断信号)
         self._preload_templates()
 
         self._screenshot_bgr = None
@@ -651,6 +658,10 @@ class GameBot:
         result = cv2.matchTemplate(img, template, cv2.TM_CCOEFF_NORMED)
         min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(result)
 
+        # 匹配诊断日志（节流）：命中 或 接近阈值时记录，避免逐帧刷屏
+        if self.match_log_enabled:
+            self._log_match_score(template_name, max_val, threshold, max_loc)
+
         if max_val >= threshold:
             h, w = template.shape[:2]
             center_x = self.game_window[0] + max_loc[0] + w // 2
@@ -658,6 +669,27 @@ class GameBot:
             return (center_x, center_y)
 
         return None
+
+    def _log_match_score(self, name, score, threshold, max_loc):
+        """节流输出匹配分数：只记录命中或接近阈值的情况。
+        命中状态翻转或分数档位变化时立即记录，否则按 MATCH_LOG_INTERVAL 间隔记录。"""
+        if not self.match_log_enabled:
+            return
+        hit = score >= threshold
+        near = (not hit) and score >= threshold - self.MATCH_LOG_NEAR
+        if not (hit or near):
+            return
+
+        # 命中/未命中 + 分数档位(0.05一档)，作为节流的状态标识
+        bucket = (hit, round(score * 20))
+        now = time.time()
+        prev = self._match_log_state.get(name)
+        if prev and prev[0] == bucket and now - prev[1] < self.MATCH_LOG_INTERVAL:
+            return
+        self._match_log_state[name] = (bucket, now)
+
+        tag = "命中" if hit else "接近阈值(未点击)"
+        print(f"[匹配] {name:<22s} {score:.3f}/{threshold:.2f} {tag} @({max_loc[0]},{max_loc[1]})")
 
     def find_all_templates(self, template_name, threshold=0.8):
         """在游戏窗口中查找所有匹配的模板图像位置"""
@@ -1587,6 +1619,9 @@ class GameBotGUI:
                     # 加载后台模式
                     background_mode = config.get("background_mode", True)
                     self.background_mode_var.set(background_mode)
+                    # 加载匹配日志开关（默认关闭）
+                    match_log_enabled = config.get("match_log_enabled", False)
+                    self.match_log_var.set(match_log_enabled)
                     # 加载战斗次数
                     max_battle_count = config.get("max_battle_count", 0)
                     self.max_battle_count_var.set(max_battle_count)
@@ -1612,6 +1647,7 @@ class GameBotGUI:
                 "rich_mode": self.rich_mode_var.get(),
                 "quick_exit": self.quick_exit_var.get(),
                 "background_mode": self.background_mode_var.get(),
+                "match_log_enabled": self.match_log_var.get(),
                 "max_battle_count": self.max_battle_count_var.get(),
                 "battle_time": self.battle_time_var.get(),
                 "priority_skills": [var.get() for var in self.priority_skill_vars]
@@ -1672,14 +1708,27 @@ class GameBotGUI:
         )
         self.quick_exit_check.grid(row=3, column=1, padx=10, pady=5, sticky=tk.W)
 
+        # 运行选项（后台模式 + 诊断日志），放在同一格纵向堆叠，不占用动态显隐的行
+        run_opts = ttk.Frame(self.root)
+        run_opts.grid(row=3, column=2, padx=10, pady=2, sticky=tk.W)
+
         # 后台模式（不占用鼠标键盘，游戏窗口不能最小化）
         self.background_mode_var = tk.BooleanVar(value=True)
         self.background_mode_check = ttk.Checkbutton(
-            self.root,
+            run_opts,
             text="后台运行（不占用鼠标键盘）",
             variable=self.background_mode_var,
         )
-        self.background_mode_check.grid(row=3, column=2, padx=10, pady=5, sticky=tk.W)
+        self.background_mode_check.grid(row=0, column=0, sticky=tk.W)
+
+        # 匹配日志（排查用，默认关闭）：开启后记录模板匹配分数到 bot.log
+        self.match_log_var = tk.BooleanVar(value=False)
+        self.match_log_check = ttk.Checkbutton(
+            run_opts,
+            text="记录匹配日志（排查用，会写入 bot.log）",
+            variable=self.match_log_var,
+        )
+        self.match_log_check.grid(row=1, column=0, sticky=tk.W)
 
         # 默认模式是环球，所以默认显示
         self.on_mode_changed(None)
@@ -1887,8 +1936,11 @@ class GameBotGUI:
                 60,
                 quick_exit,
                 self.background_mode_var.get(),
+                self.match_log_var.get(),
             )
             self.bot.on_battle_count_changed = self._update_battle_count
+            if self.match_log_var.get():
+                print("[匹配日志] 已开启：模板匹配分数将记录到 bot.log")
 
             # 更新状态
             self.status_var.set("运行中...")
@@ -1903,6 +1955,7 @@ class GameBotGUI:
                 child.config(state=tk.DISABLED)
             self.quick_exit_check.config(state=tk.DISABLED)
             self.background_mode_check.config(state=tk.DISABLED)
+            self.match_log_check.config(state=tk.DISABLED)
             self.max_battle_count_spinbox.config(state=tk.DISABLED)
             self.battle_time_spinbox.config(state=tk.DISABLED)
             for combo in self.priority_skill_combos:
@@ -1950,6 +2003,7 @@ class GameBotGUI:
             child.config(state=tk.NORMAL)
         self.quick_exit_check.config(state=tk.NORMAL)
         self.background_mode_check.config(state=tk.NORMAL)
+        self.match_log_check.config(state=tk.NORMAL)
         self.max_battle_count_spinbox.config(state=tk.NORMAL)
         self.battle_time_spinbox.config(state=tk.NORMAL)
         for combo in self.priority_skill_combos:
