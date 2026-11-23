@@ -91,6 +91,19 @@ class GameBot:
         self.abyss_pending_battle = False
         self.abyss_pending_since = 0
 
+        # 元素试炼：本次运行已完成轮数、次数用完日志去重
+        self.element_count = 0
+        self.element_no_chance_logged = False
+        # 次数耗尽需连续N次确认"在详情页但挑战按钮点不动"，防单次误判提前退出
+        self.element_no_chance_streak = 0
+        # 元素试炼"待战斗"状态：点"挑战"进入，选技能/战斗/结算期间一律不导航。
+        # 结算页只有约10秒窗口，靠状态+每轮高频检测"下一关"按钮接手，不用死等。
+        self.element_pending_battle = False
+        self.element_pending_since = 0
+        # 历练大厅下滑计数：元素试炼在最底部，需连续下滑多次才露出，
+        # 期间不依赖易滚出屏幕的深渊标题判断，避免中途被误判回首页反复重导。
+        self.element_scroll_count = 0
+
         # 前台压制：记录用户最近使用的前台窗口，游戏抢前台时立即压回
         self._last_foreground = None
         self._suppress_thread = None
@@ -697,7 +710,9 @@ class GameBot:
         bucket = (hit, round(score * 20))
         now = time.time()
         prev = self._match_log_state.get(name)
-        if prev and prev[0] == bucket and now - prev[1] < self.MATCH_LOG_INTERVAL:
+        # 单步调试时不节流：用户每点一次"下一步"就要看到完整匹配分数，
+        # 否则相同分数档位被压制，看起来像"卡住没反应"。
+        if prev and prev[0] == bucket and now - prev[1] < self.MATCH_LOG_INTERVAL and not self.debug_mode:
             return
         self._match_log_state[name] = (bucket, now)
 
@@ -989,11 +1004,46 @@ class GameBot:
         print(f"[深渊选技能] 已选 {len(picked)} 张卡，点确定 @卡位{picked} 确定({confirm_x},{confirm_y})")
         return choose
 
+    def find_click_skill_element(self):
+        """元素试炼专用选技能：前5轮4选2、第6轮起3选1。
+        与深渊同样用固定卡位，避开选中态/强化态导致的模板失配。
+        两种布局靠"选择技能"标题中心 y 区分（客户区）：
+          4选2 标题中心 y≈342，卡图标 y≈490，确定按钮 y≈748
+          3选1 标题中心 y≈205，卡图标 y≈483，点卡直接生效(无确定)
+        标题模板火焰动画帧会导致匹配分 0.6~0.96 波动，故阈值取 0.55。
+        """
+        choose = self.find_template("choose-skill.png", threshold=0.55)
+        if not choose:
+            choose = self.find_template("choose-skill-1.png", threshold=0.55)
+        if not choose:
+            return None
+
+        # find_template 返回屏幕坐标；换算回客户区 y 判断布局
+        client_y = choose[1] - self.game_window[1] if self.game_window else choose[1]
+        anchor_cx, anchor_cy = choose[0], choose[1]
+
+        if client_y > 280:
+            # 4选2：点前两张卡 + 确定
+            for dx, dy in [(-195, 148), (-65, 148)]:
+                self.click(anchor_cx + dx, anchor_cy + dy)
+                time.sleep(0.12)
+            self.click(anchor_cx - 8, anchor_cy + 406)
+            print("[元素选技能] 4选2：点2张卡+确定")
+        else:
+            # 3选1：点中间卡(约客户区 x=280,y=480)，直接生效
+            self.click(anchor_cx, anchor_cy + 278)
+            print("[元素选技能] 3选1：点中间卡")
+        time.sleep(0.3)
+        return choose
+
     def find_click_skill(self):
         self.find_click_think_tank()
         # 深渊模式走专用逻辑（4选2），其他模式保持原样（3选1）
         if self.mode == 4:
             return self.find_click_skill_abyss()
+        # 元素试炼：前5轮4选2、第6轮起3选1，用专用固定卡位逻辑
+        if self.mode == 5:
+            return self.find_click_skill_element()
         """判断能否点击技能按钮"""
         choose_skill = self.find_template("choose-skill.png")
         if not choose_skill:
@@ -1191,6 +1241,120 @@ class GameBot:
             return False
         self.click(*pos)
         time.sleep(0.3)
+        return True
+
+    # ==================== 元素试炼模式 (mode=5) ====================
+    # 导航路径: 首页 -> 基地 -> 历练大厅 ->(下滑到底) 元素试炼"挑战"
+    #           -> 元素试炼塔页 -> 点核心塔 -> 核心试炼详情页
+    #           -> "挑战" -> "开始游戏"弹窗 -> 战斗(选技能) -> 结算页
+    #           -> "下一关" -> 回核心试炼详情页(层数+1/次数-1) -> 循环
+    # 每天10次机会，次数用完即停，绝不自动点"+"。
+
+    def find_element_title(self):
+        """历练大厅底部"元素试炼"标题条锚点。
+        阈值0.9：真标题实测1.000；顶部"深渊挑战"橙色标题误匹配仅0.796，
+        阈值0.85会误命中并按偏移点到深渊卡片(跑偏模式)，故提到0.9隔离。
+        """
+        return self.find_template("element-title.png", threshold=0.9)
+
+    def find_click_element_entry(self):
+        """历练大厅：定位"元素试炼"标题，点其卡片内"挑战"按钮。
+        实测(542x1010)：标题中心(106,711)、挑战按钮中心(369,854) -> 偏移(+263,+143)。
+        """
+        title = self.find_element_title()
+        if not title:
+            return False
+        btn_x, btn_y = title[0] + 263, title[1] + 143
+        self.click(btn_x, btn_y)
+        time.sleep(0.3)
+        print(f"[元素] 点击入口挑战按钮 ({btn_x},{btn_y})")
+        return True
+
+    def scroll_lobby_down(self):
+        """历练大厅向下滑动一屏（从底部往上划），用于露出底部的元素试炼卡片。
+
+        坐标坑：_post_drag/_post_mouse 期望【屏幕坐标】并内部做 ScreenToClient；
+        客户端区目标点(271,780)->(271,300)必须加 game_window 原点偏移再传入。
+        直接传客户区坐标会被二次扣减原点变成负X，消息落到窗口外，滑动无效。
+        """
+        if not self.game_window:
+            if not self.find_game_window():
+                return
+        ox, oy = self.game_window[0], self.game_window[1]
+        self._post_drag(ox + 271, oy + 780, ox + 271, oy + 300, duration=0.4)
+        time.sleep(0.4)
+        print(f"[元素] 历练大厅下滑一次 (计数 {self.element_scroll_count}/5)")
+
+    def find_element_tower_page(self):
+        """判断是否进入元素试炼塔页（顶部"元素试炼"大字锚点）"""
+        return self.find_template("element-tower.png", threshold=0.85)
+
+    def find_click_element_core_tower(self):
+        """元素试炼塔页：点中央核心塔的发光核心，进入核心试炼详情页。
+        实测核心塔发光核心中心客户区(320,358)。
+        """
+        gw = self.game_window
+        x = gw[0] + 320 if gw else 320
+        y = gw[1] + 358 if gw else 358
+        self.click(x, y)
+        time.sleep(0.5)
+        print(f"[元素] 点击核心塔 ({x},{y})")
+        return True
+
+    def find_element_core_page(self):
+        """判断是否进入核心试炼详情页——只用"挑战"按钮做判据。
+        曾把标题 element-core-page.png(阈值0.75)作辅判据，但历练大厅顶部
+        "跨服战争争霸"卡片会误匹配到0.936，导致在大厅里误判"在详情页"，
+        随后找不到挑战按钮被当成"次数用完"提前退出(实际次数9/10)。
+        挑战按钮实测：真详情页1.000，大厅元素卡片0.65，阈值0.9可干净区分。
+        """
+        return bool(self.find_template("element-core-btn.png", threshold=0.9))
+
+    def find_element_challenge_greyed(self):
+        """次数用完后挑战按钮变灰：用较低阈值确认"详情页还在、但按钮已灰"。
+        真页橙色按钮1.000；灰色按钮分数会掉到0.9以下；大厅元素卡片仅0.65。
+        取阈值0.78：能覆盖灰按钮，又不会把大厅卡片(0.65)误判成灰按钮。
+        """
+        return bool(self.find_template("element-core-btn.png", threshold=0.78))
+
+    def find_click_element_challenge(self):
+        """核心试炼详情页：点"挑战"按钮（模板定位）。
+        次数用完时按钮变灰/消失 -> 匹配失败返回False。
+        """
+        pos = self.find_template("element-core-btn.png", threshold=0.9)
+        if not pos:
+            return False
+        self.click(*pos)
+        time.sleep(0.3)
+        return True
+
+    def find_click_element_start(self):
+        """点击"开始游戏"弹窗按钮；无弹窗返回False。"""
+        pos = self.find_template("element-start.png", threshold=0.9)
+        if not pos:
+            return False
+        self.click(*pos)
+        time.sleep(0.4)
+        return True
+
+    def find_click_element_next(self):
+        """结算页：点击"下一关"按钮。
+        关键：用只含"下一关"三字的紧致模板 element-next-text.png，而非整块橙色按钮——
+        整块按钮与选技能页"0/2确定"按钮形状颜色几乎一样(误匹配0.846)，会导致脚本
+        在选技能页误判结算页狂点下一关(选技能只完成第一轮的真正根因)。
+        文字模板实测：真结算页0.98~1.0，选技能页确定按钮仅0.389，阈值0.75安全隔离。
+        """
+        pos = self.find_template("element-next-text.png", threshold=0.75)
+        if not pos:
+            return False
+        # 下一关按钮在结算页底部，客户区y≈898；加坐标下限排除顶部偶发误匹配
+        client_y = pos[1] - self.game_window[1] if self.game_window else pos[1]
+        if client_y < 700:
+            if self.match_log_enabled:
+                print(f"[元素] 下一关文字在y={client_y}误匹配，忽略")
+            return False
+        self.click(*pos)
+        time.sleep(0.4)
         return True
 
     def find_click_expedition_challenge(self):
@@ -1461,6 +1625,108 @@ class GameBot:
             if not self.game_window and not self.find_game_window():
                 time.sleep(5)
                 continue
+
+            # ==================== 元素试炼模式 (mode=5) ====================
+            # 全流程自管理，放在通用点击之前：结算页背景是战斗画面，若走通用
+            # find_click_return() 会误点到结算页"返回"而退出。故本模式独立处理
+            # 导航/选技能/结算，continue 跳过下方所有通用逻辑。
+            if self.mode == 5:
+                # 1) 结算页最优先：只有约10秒窗口，且背景战斗画面有选技能残留模板
+                #    (实测0.70)，若先判选技能会在结算页误点、耗尽窗口。故先找"下一关"。
+                if self.find_click_element_next():
+                    self.element_count += 1
+                    self.element_pending_battle = False
+                    self.element_pending_since = time.time()  # 借用计时：结算后过渡保护
+                    self.battle_count += 1
+                    if self.on_battle_count_changed:
+                        self.on_battle_count_changed(self.battle_count)
+                    print(f"[元素] 结算页点下一关，第 {self.element_count} 轮完成，等待回详情页")
+                    # 过渡保护：点下一关后页面需约2秒切回核心试炼详情页，
+                    # 中间态不匹配任何页面，若立即往下走会误触发导航回大厅。
+                    time.sleep(2.0)
+                    continue
+                # 2) 选技能界面（战斗中最常见，必须高频响应）
+                if self.find_click_skill_element():
+                    continue
+
+                # 3) 待战斗状态：选技能/战斗/倒计时/结算期间一律不导航。
+                if self.element_pending_battle:
+                    # 点"挑战"后会弹"开始游戏"确认框（本分支会先于第4步执行，
+                    # 若不在这里处理，下面的 continue 会让第4步永远轮不到 -> 卡死）。
+                    if self.find_click_element_start():
+                        print("[元素] 待战斗中点开始游戏，进入战斗")
+                        continue
+                    # 已回到核心试炼详情页 -> 本轮结束，清状态继续走下面步骤5点挑战
+                    # 用低阈值：次数用完时按钮变灰也能识别，交给步骤5判定停止
+                    if self.find_element_challenge_greyed():
+                        self.element_pending_battle = False
+                        self.element_scroll_count = 0
+                    else:
+                        # 仍在战斗/加载中，超时兜底防止卡死
+                        if time.time() - self.element_pending_since > 240:
+                            print("[元素] 待战斗超时，重置状态")
+                            self.element_pending_battle = False
+                        continue
+
+                # 4) "开始游戏"弹窗 -> 点它进入战斗，进入待战斗状态
+                if self.find_click_element_start():
+                    self.element_pending_battle = True
+                    self.element_pending_since = time.time()
+                    continue
+
+                # 5) 核心试炼详情页 -> 点"挑战"
+                # 入口用低阈值(0.78)判断"在详情页"（橙色按钮1.0、灰色按钮0.8x都能命中，
+                # 大厅卡片0.65不会命中），再区分按钮是否可点：
+                #   0.9命中=橙色可点 -> 点挑战；0.9未命中但0.78命中=灰色 -> 次数用完。
+                if self.find_element_challenge_greyed():
+                    if self.find_click_element_challenge():
+                        print(f"[元素] 第 {self.element_count+1} 轮挑战开始")
+                        # 进入待战斗：下一步会出现"开始游戏"弹窗
+                        self.element_pending_battle = True
+                        self.element_pending_since = time.time()
+                        self.element_no_chance_streak = 0
+                    else:
+                        # 挑战按钮变灰 = 次数用完。连续3次确认防页面切换瞬间误判。
+                        self.element_no_chance_streak += 1
+                        if self.element_no_chance_streak >= 3:
+                            if not self.element_no_chance_logged:
+                                print(f"[元素] 剩余次数已用完，共完成 {self.element_count} 轮，脚本停止")
+                                self.element_no_chance_logged = True
+                            self.running = False
+                            break
+                        time.sleep(0.5)
+                    continue
+
+                # 6) 元素试炼塔页 -> 点中央核心塔
+                if self.find_element_tower_page():
+                    self.find_click_element_core_tower()
+                    continue
+
+                # 7) 历练大厅：找元素试炼标题 -> 点其"挑战"入口（找到即重置下滑计数）
+                if self.find_element_title():
+                    self.element_scroll_count = 0
+                    self.find_click_element_entry()
+                    continue
+
+                # 8) 下滑阶段：持续下滑露出底部的元素试炼卡片。
+                #    不依赖易滚出屏幕的锚点，只用计数器；上限到了仍未找到就重新导航。
+                if self.element_scroll_count > 0 and self.element_scroll_count < 6:
+                    self.scroll_lobby_down()
+                    self.element_scroll_count += 1
+                    time.sleep(0.3)
+                    continue
+
+                # 9) 首页/基地 -> 逐层导航进历练大厅，并把下滑计数置1（进入下滑阶段）
+                #    点"基地"后必须等页面切换完成再找"历练大厅"，否则第二次点击扑空。
+                if self.find_base():
+                    self.find_click_base()
+                    time.sleep(1.0)
+                self.find_click_experience()
+                self.element_scroll_count = 1
+                print("[元素] 导航：进入历练大厅，准备下滑找元素试炼")
+                time.sleep(0.5)
+                continue
+
             # 点击领取
             self.find_click_receive()
 
@@ -1487,6 +1753,8 @@ class GameBot:
                     print("[深渊] 战斗循环中检测到强化弹窗，点确定并跳出")
                     break
 
+                # 元素试炼：结算页背景是战斗画面，会被find_battling()误判为战斗中。
+                # 每轮先检测结算页"下一关"按钮，点到就跳出内层循环，标记本轮完成。
                 battling = self.find_battling()
                 if not battling:
                     break
@@ -1800,7 +2068,7 @@ class GameBotGUI:
                     self.game_title_var.set(game_title)
                     # 加载模式
                     mode = config.get("mode", "环球")
-                    if mode in ["环球", "主线", "深渊挑战", "普通远征", "超级远征"]:
+                    if mode in ["环球", "主线", "深渊挑战", "元素试炼", "普通远征", "超级远征"]:
                         self.mode_var.set(mode)
                     # 加载消费模式
                     rich_mode = config.get("rich_mode", 0)
@@ -1875,7 +2143,7 @@ class GameBotGUI:
         self.mode_combo = ttk.Combobox(
             self.root,
             textvariable=self.mode_var,
-            values=["环球", "主线", "深渊挑战", "普通远征", "超级远征"],
+            values=["环球", "主线", "深渊挑战", "元素试炼", "普通远征", "超级远征"],
             width=15,
             state="readonly",
         )
@@ -2116,7 +2384,7 @@ class GameBotGUI:
             # 获取界面参数
             game_title = self.game_title_var.get()
             mode_text = self.mode_var.get()
-            mode_map = {"环球": 0, "主线": 1, "普通远征": 2, "超级远征": 3, "深渊挑战": 4}
+            mode_map = {"环球": 0, "主线": 1, "普通远征": 2, "超级远征": 3, "深渊挑战": 4, "元素试炼": 5}
             mode = mode_map.get(mode_text, 0)
             max_battle_count = self.max_battle_count_var.get()
             battle_time = self.battle_time_var.get()
