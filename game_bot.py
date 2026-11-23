@@ -50,8 +50,14 @@ class GameBot:
         quick_exit=False,
         background_mode=True,
         match_log_enabled=False,
+        debug_mode=False,
     ):
         self.running = True
+        # 单步调试模式：主循环每轮开头阻塞在 step_event，由 GUI 点"下一步"放行一轮。
+        # 用 threading.Event 做线程间同步，避免自动连跑刷屏，便于逐步观察决策。
+        self.debug_mode = debug_mode
+        self.step_event = threading.Event()
+        self.step_count = 0
         self.hotkey_listener = None
         self.mouse_listener = None
         # 记录用户最近一次点击的位置和时间（用于判断是否在主动操作游戏）
@@ -77,6 +83,13 @@ class GameBot:
         self.wait_time = wait_time
         self.battle_count = 0
         self.last_battle_count_time = 0
+        # 深渊挑战：本次运行已发起的挑战次数（点一次"挑战"算一次）
+        self.abyss_count = 0
+        self.abyss_no_chance_logged = False
+        # 深渊"待战斗"状态：点挑战后进入，倒计时/强化弹窗/选技能/战斗期间一律不导航。
+        # 用状态而非死等时间（倒计时约10秒，死等8秒会在弹窗出现前误判为不在深渊页）。
+        self.abyss_pending_battle = False
+        self.abyss_pending_since = 0
 
         # 前台压制：记录用户最近使用的前台窗口，游戏抢前台时立即压回
         self._last_foreground = None
@@ -932,8 +945,55 @@ class GameBot:
         """判断能否点击继续战斗按钮"""
         self.click_template("auto-close.png")
 
+    def find_click_skill_abyss(self):
+        """深渊专用选技能：4张卡选2张 + 点确定，循环直到界面消失。
+
+        深渊的卡是普通技能，但选中态(金框/深蓝底)、强化态(强化数字+背景框)
+        会改变视觉，导致从普通态截的技能模板失配(实测大图模板仅0.3~0.45)。
+        因此改用固定卡位点击：4张卡位置固定，与视觉状态无关。
+
+        【重要】不要再用技能模板去匹配卡片：战斗中选技能时背景是战斗画面，
+        技能小图标(如skill-d-1.png)会以高分误匹配到画面空白处(实测0.872@(511,381))，
+        点击落空 -> 实际只选到1张 -> 底部停在"1/2确定" -> 卡在选技能界面反复循环。
+        所以这里100%用相对锚点的固定卡位，不依赖任何技能图像匹配。
+        """
+        choose = self.find_template("choose-skill.png")
+        if not choose:
+            choose = self.find_template("choose-skill-1.png")
+        if not choose:
+            return None
+
+        # find_template 返回的 choose 已经是"选择技能"锚点的中心点(屏幕坐标)，
+        # 不要再叠加模板宽高的一半。
+        anchor_cx, anchor_cy = choose[0], choose[1]
+
+        # 4个卡位图标中心相对锚点中心的偏移（实测 542x1010 客户区）
+        # 锚点中心客户区：开战前(280,459)/战斗中(280,342)，卡图标中心在锚点下方151px
+        # x 相对锚点：-195/-65/+65/+195 -> 客户区 85/215/345/475
+        card_offsets = [(-195, 151), (-65, 151), (65, 151), (195, 151)]
+
+        # 只用固定卡位点2张不同的卡（每轮进入都是全新"0/2"，卡位固定，点2张即可）
+        picked = []
+        for dx, dy in card_offsets[:2]:
+            px, py = anchor_cx + dx, anchor_cy + dy
+            if self.match_log_enabled:
+                print(f"[深渊选技能] 点卡位 客户区偏移量({dx},{dy})")
+            self.click(px, py)
+            picked.append((px, py))
+            time.sleep(0.15)
+
+        # 点底部确定：锚点正下方偏左约8px、下移约410px
+        confirm_x, confirm_y = anchor_cx - 8, anchor_cy + 410
+        self.click(confirm_x, confirm_y)
+        time.sleep(0.3)
+        print(f"[深渊选技能] 已选 {len(picked)} 张卡，点确定 @卡位{picked} 确定({confirm_x},{confirm_y})")
+        return choose
+
     def find_click_skill(self):
         self.find_click_think_tank()
+        # 深渊模式走专用逻辑（4选2），其他模式保持原样（3选1）
+        if self.mode == 4:
+            return self.find_click_skill_abyss()
         """判断能否点击技能按钮"""
         choose_skill = self.find_template("choose-skill.png")
         if not choose_skill:
@@ -1078,6 +1138,60 @@ class GameBot:
     def find_click_experience(self):
         """判断能否点击历练按钮"""
         self.click_template("experience.png")
+
+    # ==================== 深渊挑战模式 (mode=4) ====================
+    # 导航路径: 首页 -> 基地 -> 历练大厅 -> 深渊挑战页 -> 挑战 -> 战斗 -> 结算 -> 回深渊页
+    # 全部模板基于 542x1010 客户区截图，缩放比例一致。
+    # 历练大厅有4个同形"挑战"按钮，必须用"深渊挑战"标题做锚点定位，不能全局找挑战。
+
+    def find_abyss_title(self):
+        """在历练大厅定位"深渊挑战"标题条(唯一锚点)，返回其左上角坐标"""
+        return self.find_template("abyss-title.png")
+
+    def find_click_abyss_entry(self):
+        """在历练大厅：找到深渊挑战标题锚点，点击其卡片内的"挑战"按钮。
+
+        注意 find_template() 返回的是模板"中心点"屏幕坐标，不是左上角，
+        所以偏移必须以标题中心为基准，不能拿左上角的偏移来加。
+        实测(542×1010)：标题中心(109,262)、挑战按钮中心(370,407) → 偏移(+261,+145)。
+        """
+        title = self.find_abyss_title()
+        if not title:
+            return False
+        # 挑战按钮中心 = 标题中心 + 固定偏移（实测，相对中心而非左上角）
+        btn_x = title[0] + 261
+        btn_y = title[1] + 145
+        self.click(btn_x, btn_y)
+        time.sleep(0.3)
+        print(f"[深渊] 点击入口挑战按钮 ({btn_x},{btn_y})")
+        return True
+
+    def find_click_abyss_confirm(self):
+        """点击"深渊怪物强化"弹窗的确定按钮(阈值0.9，避免误点选技能界面的确定)"""
+        pos = self.find_template("abyss-confirm.png", threshold=0.9)
+        if not pos:
+            return False
+        self.click(*pos)
+        time.sleep(0.3)
+        return True
+
+    def find_abyss_page(self):
+        """判断是否已进入深渊挑战页面：用顶部"当前层数"固定锚点判定。
+        该锚点在深渊页=1.0，其他页面约0.5，不随挑战次数变化，
+        因此与"挑战按钮是否可点"解耦，次数用完时仍能正确识别在深渊页。
+        """
+        return self.find_template("abyss-page-anchor.png", threshold=0.85)
+
+    def find_click_abyss_challenge(self):
+        """在深渊挑战页点击"挑战"按钮。
+        次数用完后按钮变灰，模板匹配分数会低于0.85 -> 返回False 表示次数耗尽。
+        """
+        pos = self.find_template("abyss-page-challenge.png", threshold=0.9)
+        if not pos:
+            return False
+        self.click(*pos)
+        time.sleep(0.3)
+        return True
 
     def find_click_expedition_challenge(self):
         """判断能否点击远征挑战按钮"""
@@ -1266,6 +1380,8 @@ class GameBot:
             if key == keyboard.Key.esc:
                 print("检测到ESC键，正在停止脚本...")
                 self.running = False
+                # 单步阻塞时唤醒主循环线程，避免按ESC后线程仍卡在等待
+                self.step_event.set()
                 if self.hotkey_listener:
                     self.hotkey_listener.stop()
                 if self.mouse_listener:
@@ -1325,6 +1441,16 @@ class GameBot:
 
         # timestamp = time.time()
         while self.running:
+            # 单步调试：每轮阻塞等待 GUI 点"下一步"，避免自动连跑刷屏。
+            # 只有放行后才执行本轮逻辑；停止时 stop_bot 会 set 事件唤醒线程退出。
+            if self.debug_mode:
+                self.step_count += 1
+                print(f"\n[单步] 第 {self.step_count} 步就绪 — 点击 GUI「下一步」执行本轮")
+                self.step_event.wait()
+                self.step_event.clear()
+                if not self.running:
+                    break
+
             # 检查是否达到刷图次数
             if self.max_battle_count > 0 and self.battle_count >= self.max_battle_count:
                 print(f"已完成 {self.battle_count} 次刷图，脚本停止")
@@ -1352,6 +1478,14 @@ class GameBot:
 
             # 是不是在战斗中
             while True and self.running:
+
+                # 深渊模式：强化弹窗的战斗背景会让 find_battling() 误判为"战斗中"。
+                # 但内层循环只会点选技能/继续/重连/返回，都不处理强化弹窗的"确定"，
+                # 导致在这个 while 里空转卡死。所以每轮先检查强化弹窗：出现就点确定并
+                # 跳出内层循环，交给外层 mode=4 分支接管（它会继续选技能/战斗流程）。
+                if self.mode == 4 and self.find_click_abyss_confirm():
+                    print("[深渊] 战斗循环中检测到强化弹窗，点确定并跳出")
+                    break
 
                 battling = self.find_battling()
                 if not battling:
@@ -1390,6 +1524,64 @@ class GameBot:
                         "战斗时间:",
                         round(time.time() - self.current_battle_time, 1),
                     )
+
+            # 深渊挑战模式 (mode=4)
+            # 从首页自动导航进入深渊页，循环挑战直到次数用完。
+            # 绝不自动点"+"加次数（避免误触收费），次数由用户手动加。
+            if self.mode == 4:
+                # 待战斗状态：点挑战后，依次经历 倒计时(约10s,自动过) -> 强化弹窗 -> 选技能 -> 战斗
+                # 期间一律不导航（弹窗/选技能会遮住深渊页锚点，误判为"不在深渊页"而乱点基地）。
+                if self.abyss_pending_battle:
+                    # 1) 强化弹窗出现 -> 点确定进入选技能/战斗
+                    if self.find_click_abyss_confirm():
+                        continue
+                    # 2) 已回到深渊页 -> 说明这一轮打完了（次数用完时挑战按钮会变灰），
+                    #    清除待战斗状态，让下面正常判断能否再挑战一次
+                    if self.find_abyss_page():
+                        self.abyss_pending_battle = False
+                        # 不 continue，继续走下面的"在深渊页"逻辑
+                    else:
+                        # 3) 倒计时/选技能/战斗/结算中 -> 交给战斗循环处理，这里只等待
+                        #    超时兜底：60秒还没回深渊页，强制清除避免卡死
+                        if time.time() - self.abyss_pending_since > 60:
+                            print("[深渊] 待战斗超时，重置状态")
+                            self.abyss_pending_battle = False
+                        continue
+
+                # 强化弹窗兜底：若刚进循环就遇到弹窗（非待战斗状态），点确定
+                if self.find_click_abyss_confirm():
+                    continue
+
+                in_abyss = self.find_abyss_page()
+                if in_abyss:
+                    # 已在深渊挑战页：点"挑战"开始一次
+                    if self.find_click_abyss_challenge():
+                        self.abyss_count += 1
+                        self.abyss_no_chance_logged = False
+                        print(f"[深渊] 第 {self.abyss_count} 次挑战开始")
+                        # 进入待战斗状态：倒计时->强化弹窗->选技能->战斗->回深渊页
+                        self.abyss_pending_battle = True
+                        self.abyss_pending_since = time.time()
+                    else:
+                        # 挑战按钮变灰/消失 = 次数用完
+                        if not self.abyss_no_chance_logged:
+                            print(f"[深渊] 剩余次数已用完，共完成 {self.abyss_count} 次挑战，脚本停止")
+                            self.abyss_no_chance_logged = True
+                        self.running = False
+                        break
+                else:
+                    # 不在深渊页：按导航路径逐层进入
+                    # 1) 历练大厅 -> 深渊挑战页
+                    if self.find_abyss_title():
+                        self.find_click_abyss_entry()
+                        time.sleep(0.8)
+                    else:
+                        # 2) 首页/基地 -> 历练大厅 -> (下一轮再找深渊标题)
+                        self.find_click_base()
+                        self.find_click_experience()
+                        time.sleep(0.5)
+                # 交给下方的通用"点击继续"和战斗循环处理
+                continue
 
             # 是否刷环球
             if self.mode == 0:
@@ -1608,7 +1800,7 @@ class GameBotGUI:
                     self.game_title_var.set(game_title)
                     # 加载模式
                     mode = config.get("mode", "环球")
-                    if mode in ["环球", "主线", "普通远征", "超级远征"]:
+                    if mode in ["环球", "主线", "深渊挑战", "普通远征", "超级远征"]:
                         self.mode_var.set(mode)
                     # 加载消费模式
                     rich_mode = config.get("rich_mode", 0)
@@ -1622,6 +1814,9 @@ class GameBotGUI:
                     # 加载匹配日志开关（默认关闭）
                     match_log_enabled = config.get("match_log_enabled", False)
                     self.match_log_var.set(match_log_enabled)
+                    # 加载单步调试开关（默认关闭）
+                    debug_mode = config.get("debug_mode", False)
+                    self.debug_mode_var.set(debug_mode)
                     # 加载战斗次数
                     max_battle_count = config.get("max_battle_count", 0)
                     self.max_battle_count_var.set(max_battle_count)
@@ -1648,6 +1843,7 @@ class GameBotGUI:
                 "quick_exit": self.quick_exit_var.get(),
                 "background_mode": self.background_mode_var.get(),
                 "match_log_enabled": self.match_log_var.get(),
+                "debug_mode": self.debug_mode_var.get(),
                 "max_battle_count": self.max_battle_count_var.get(),
                 "battle_time": self.battle_time_var.get(),
                 "priority_skills": [var.get() for var in self.priority_skill_vars]
@@ -1679,7 +1875,7 @@ class GameBotGUI:
         self.mode_combo = ttk.Combobox(
             self.root,
             textvariable=self.mode_var,
-            values=["环球", "主线", "普通远征", "超级远征"],
+            values=["环球", "主线", "深渊挑战", "普通远征", "超级远征"],
             width=15,
             state="readonly",
         )
@@ -1729,6 +1925,15 @@ class GameBotGUI:
             variable=self.match_log_var,
         )
         self.match_log_check.grid(row=1, column=0, sticky=tk.W)
+
+        # 单步调试（排查用，默认关闭）：开启后主循环每轮需点"下一步"才执行，避免刷屏
+        self.debug_mode_var = tk.BooleanVar(value=False)
+        self.debug_mode_check = ttk.Checkbutton(
+            run_opts,
+            text="单步调试（点“下一步”才走一步，避免刷屏）",
+            variable=self.debug_mode_var,
+        )
+        self.debug_mode_check.grid(row=2, column=0, sticky=tk.W)
 
         # 默认模式是环球，所以默认显示
         self.on_mode_changed(None)
@@ -1808,6 +2013,16 @@ class GameBotGUI:
             state=tk.DISABLED,
         )
         self.stop_btn.pack(side=tk.LEFT, padx=10)
+
+        # 单步按钮（仅单步调试模式可用）：点一下放行主循环一轮
+        self.step_btn = ttk.Button(
+            button_frame,
+            text="下一步 ▶",
+            command=self.step_once,
+            width=15,
+            state=tk.DISABLED,
+        )
+        self.step_btn.pack(side=tk.LEFT, padx=10)
 
         # 调整窗口大小按钮
         self.resize_btn = ttk.Button(
@@ -1901,12 +2116,13 @@ class GameBotGUI:
             # 获取界面参数
             game_title = self.game_title_var.get()
             mode_text = self.mode_var.get()
-            mode_map = {"环球": 0, "主线": 1, "普通远征": 2, "超级远征": 3}
+            mode_map = {"环球": 0, "主线": 1, "普通远征": 2, "超级远征": 3, "深渊挑战": 4}
             mode = mode_map.get(mode_text, 0)
             max_battle_count = self.max_battle_count_var.get()
             battle_time = self.battle_time_var.get()
             rich_mode = self.rich_mode_var.get()
             quick_exit = self.quick_exit_var.get()
+            debug_mode = self.debug_mode_var.get()
 
             # 获取5个优先技能（将中文名称转换为模板文件名）
             priority_skills = []
@@ -1937,13 +2153,19 @@ class GameBotGUI:
                 quick_exit,
                 self.background_mode_var.get(),
                 self.match_log_var.get(),
+                debug_mode,
             )
             self.bot.on_battle_count_changed = self._update_battle_count
             if self.match_log_var.get():
                 print("[匹配日志] 已开启：模板匹配分数将记录到 bot.log")
 
             # 更新状态
-            self.status_var.set("运行中...")
+            if debug_mode:
+                self.status_var.set("单步调试：点「下一步」开始第 1 步")
+                self.step_btn.config(state=tk.NORMAL)
+            else:
+                self.status_var.set("运行中...")
+                self.step_btn.config(state=tk.DISABLED)
             self.battle_count_var.set("战斗次数: 0")
             self.start_btn.config(state=tk.DISABLED)
             self.stop_btn.config(state=tk.NORMAL)
@@ -1956,6 +2178,7 @@ class GameBotGUI:
             self.quick_exit_check.config(state=tk.DISABLED)
             self.background_mode_check.config(state=tk.DISABLED)
             self.match_log_check.config(state=tk.DISABLED)
+            self.debug_mode_check.config(state=tk.DISABLED)
             self.max_battle_count_spinbox.config(state=tk.DISABLED)
             self.battle_time_spinbox.config(state=tk.DISABLED)
             for combo in self.priority_skill_combos:
@@ -1969,6 +2192,15 @@ class GameBotGUI:
         except Exception as e:
             messagebox.showerror("错误", f"启动失败: {str(e)}")
             self.status_var.set("就绪")
+
+    def step_once(self):
+        """单步调试：放行主循环执行一轮，然后重新阻塞等待下一次点击"""
+        bot = self.bot
+        if bot and bot.debug_mode and bot.running:
+            bot.step_event.set()
+            self.status_var.set(
+                f"单步调试：已放行第 {bot.step_count} 步 — 等待下一次点击"
+            )
 
     def run_bot(self):
         """运行游戏机器人主循环"""
@@ -1989,12 +2221,15 @@ class GameBotGUI:
         """停止游戏机器人"""
         if self.bot:
             self.bot.running = False
+            # 单步模式下线程可能阻塞在 step_event.wait()，唤醒它以便线程退出
+            self.bot.step_event.set()
             self.bot = None
 
         # 更新状态
         self.status_var.set("已停止")
         self.start_btn.config(state=tk.NORMAL)
         self.stop_btn.config(state=tk.DISABLED)
+        self.step_btn.config(state=tk.DISABLED)
 
         # 启用所有参数控件
         self.game_title_entry.config(state=tk.NORMAL)
@@ -2004,6 +2239,7 @@ class GameBotGUI:
         self.quick_exit_check.config(state=tk.NORMAL)
         self.background_mode_check.config(state=tk.NORMAL)
         self.match_log_check.config(state=tk.NORMAL)
+        self.debug_mode_check.config(state=tk.NORMAL)
         self.max_battle_count_spinbox.config(state=tk.NORMAL)
         self.battle_time_spinbox.config(state=tk.NORMAL)
         for combo in self.priority_skill_combos:
@@ -2027,6 +2263,7 @@ class GameBotGUI:
         """退出应用程序"""
         if self.bot:
             self.bot.running = False
+            self.bot.step_event.set()  # 唤醒单步阻塞，让线程尽快退出
         # 恢复标准输出
         if hasattr(self, '_stdout_redirector'):
             sys.stdout = sys.__stdout__
