@@ -1001,11 +1001,20 @@ class GameBot:
             selected.append(ratio >= 0.08)
         return selected
 
+    # 技能模板取自更大的卡面特写(图标直径≈85px)，而选技能界面的卡图标≈60px。
+    # 实测模板缩放 0.70~0.75 时匹配分 0.93~0.98，1.0 原尺寸则全部<0.01(根本匹配不到)。
+    SKILL_TPL_SCALE = 0.72
+
     def _match_templates_in_roi(self, img, cx, cy, templates, threshold=0.65):
-        """仅在卡位 ROI 内匹配模板，避免全屏误匹配战斗背景。"""
+        """仅在卡位 ROI 内匹配技能模板，避免全屏误匹配战斗背景。
+
+        关键：模板需按 SKILL_TPL_SCALE 缩放后才能匹配当前界面的卡图标，
+        否则原尺寸(136x128)大于ROI且图标尺度不符，全部漏匹配 -> 优先级失效、
+        退化成从左到右固定点。缩放后的模板缓存复用，避免每卡重复 resize。
+        """
         h_img, w_img = img.shape[:2]
-        x1, y1 = max(0, cx - 60), max(0, cy - 70)
-        x2, y2 = min(w_img, cx + 60), min(h_img, cy + 70)
+        x1, y1 = max(0, cx - 65), max(0, cy - 80)
+        x2, y2 = min(w_img, cx + 65), min(h_img, cy + 80)
         roi = img[y1:y2, x1:x2]
         if roi.size == 0:
             return 0.0
@@ -1015,14 +1024,18 @@ class GameBot:
                 continue
             if not name.endswith(".png"):
                 name = f"{name}.png"
-            if name in self.template_cache:
-                tmpl = self.template_cache[name]
+            cache_key = f"scaled:{name}"
+            if cache_key in self.template_cache:
+                tmpl = self.template_cache[cache_key]
             else:
-                tmpl = cv2.imread(os.path.join(self.template_dir, name))
-                if tmpl is not None:
-                    self.template_cache[name] = tmpl
-            if tmpl is None:
-                continue
+                raw = cv2.imread(os.path.join(self.template_dir, name))
+                if raw is None:
+                    continue
+                tmpl = cv2.resize(
+                    raw, None, fx=self.SKILL_TPL_SCALE, fy=self.SKILL_TPL_SCALE,
+                    interpolation=cv2.INTER_AREA,
+                )
+                self.template_cache[cache_key] = tmpl
             th, tw = tmpl.shape[:2]
             rh, rw = roi.shape[:2]
             if th > rh or tw > rw:
@@ -1056,16 +1069,22 @@ class GameBot:
         slot_rank.sort()
         return [slot for _, __, slot in slot_rank]
 
-    def find_click_skill_abyss(self):
-        """深渊专用选技能：4选2 + 点确定。
+    def find_click_skill_abyss(self, anchor=None, tag="深渊"):
+        """深渊/元素试炼共用的 4选2 选技能：先识别已选卡位，再补点，避免重复点击取消。
 
         固定卡位点击（选中态会改外观，全屏技能模板易误匹配背景）。
         若已有卡被勾选，再点同一卡会取消，导致卡在 1/2。
         因此先识别已选卡位，只点未选中的，并按技能优先级填满 2 张。
+
+        anchor: 可选的「选择技能」锚点(屏幕坐标)。元素试炼火焰帧匹配分波动，
+                需外部用 0.55 阈值找到后传入，避免此处 0.8 默认阈值漏匹配。
+        tag: 日志前缀，区分深渊/元素。
         """
-        choose = self.find_template("choose-skill.png")
+        choose = anchor
         if not choose:
-            choose = self.find_template("choose-skill-1.png")
+            choose = self.find_template("choose-skill.png")
+            if not choose:
+                choose = self.find_template("choose-skill-1.png")
         if not choose:
             return None
 
@@ -1080,7 +1099,7 @@ class GameBot:
         selected_count = sum(1 for s in selected if s)
         preferred = self._abyss_preferred_slots(img, client_centers)
         print(
-            f"[深渊选技能] 已选位={selected} 共{selected_count} "
+            f"[{tag}选技能] 已选位={selected} 共{selected_count} "
             f"优先顺序={preferred}"
         )
 
@@ -1089,7 +1108,7 @@ class GameBot:
             confirm_x, confirm_y = anchor_cx - 8, anchor_cy + 410
             self.click(confirm_x, confirm_y)
             time.sleep(0.4)
-            print(f"[深渊选技能] 已满2张，直接确定 ({confirm_x},{confirm_y})")
+            print(f"[{tag}选技能] 已满2张，直接确定 ({confirm_x},{confirm_y})")
             return choose
 
         need = 2 - selected_count
@@ -1112,16 +1131,15 @@ class GameBot:
         self.click(confirm_x, confirm_y)
         time.sleep(0.4)
         print(
-            f"[深渊选技能] 新点{len(picked)}张{picked}，确定({confirm_x},{confirm_y})"
+            f"[{tag}选技能] 新点{len(picked)}张{picked}，确定({confirm_x},{confirm_y})"
         )
         return choose
 
     def find_click_skill_element(self):
         """元素试炼专用选技能：前5轮4选2、第6轮起3选1。
-        与深渊同样用固定卡位，避开选中态/强化态导致的模板失配。
         两种布局靠"选择技能"标题中心 y 区分（客户区）：
           4选2 标题中心 y≈342，卡图标 y≈490，确定按钮 y≈748
-          3选1 标题中心 y≈205，卡图标 y≈483，点卡直接生效(无确定)
+          3选1 标题中心 y≈205，卡图标 y≈485，文字 y≈570，点卡直接生效(无确定)
         标题模板火焰动画帧会导致匹配分 0.6~0.96 波动，故阈值取 0.55。
         """
         choose = self.find_template("choose-skill.png", threshold=0.55)
@@ -1135,16 +1153,15 @@ class GameBot:
         anchor_cx, anchor_cy = choose[0], choose[1]
 
         if client_y > 280:
-            # 4选2：点前两张卡 + 确定
-            for dx, dy in [(-195, 148), (-65, 148)]:
-                self.click(anchor_cx + dx, anchor_cy + dy)
-                time.sleep(0.12)
-            self.click(anchor_cx - 8, anchor_cy + 406)
-            print("[元素选技能] 4选2：点2张卡+确定")
+            # 4选2：复用深渊已验证的「识别已选→补点→确定」逻辑，
+            # 避免旧版每轮固定点前两张、点太快导致停在 1/2 反复循环。
+            # 传入本方法用 0.55 阈值找到的锚点(火焰帧默认0.8会漏匹配)。
+            return self.find_click_skill_abyss(anchor=choose, tag="元素")
         else:
-            # 3选1：点中间卡(约客户区 x=280,y=480)，直接生效
-            self.click(anchor_cx, anchor_cy + 278)
-            print("[元素选技能] 3选1：点中间卡")
+            # 3选1：点卡片下半部文字区(y≈570)，图标区(y≈473)点不中。
+            # 探查实测成功点为客户区(96,540)，相对锚点y=195偏移≈345。
+            self.click(anchor_cx, anchor_cy + 345)
+            print("[元素选技能] 3选1：点中间卡文字区")
         time.sleep(0.3)
         return choose
 
