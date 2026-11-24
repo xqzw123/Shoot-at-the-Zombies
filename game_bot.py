@@ -101,6 +101,9 @@ class GameBot:
         # 结算页只有约10秒窗口，靠状态+每轮高频检测"下一关"按钮接手，不用死等。
         self.element_pending_battle = False
         self.element_pending_since = 0
+        # 结算页点"下一关"后的过渡标记：游戏会直接进入下一局(可能跳过详情页和
+        # 开始游戏弹窗)。此期间严禁导航，否则会被误判成"不在任何页面"而跑回大厅。
+        self.element_after_next = False
         # 历练大厅下滑计数：元素试炼在最底部，需连续下滑多次才露出，
         # 期间不依赖易滚出屏幕的深渊标题判断，避免中途被误判回首页反复重导。
         self.element_scroll_count = 0
@@ -1505,6 +1508,25 @@ class GameBot:
         time.sleep(0.4)
         return True
 
+    def find_click_activated_skills(self):
+        """关闭每局开局都会弹出的「已激活技能」确认页。
+
+        用户实测：点弹窗中间的技能卡不会消失，必须点下方文字/空白区域；
+        即使不点，9 秒后也会自动消失。标题模板用于识别该页，底部提示行兜底。
+        截图客户区为 542x1010，底部提示行中心约 (271, 925)。
+        """
+        title = self.find_template("activated-skills-title.png", threshold=0.85)
+        tip = None if title else self.find_template("activated-skills-tip.png", threshold=0.8)
+        if not title and not tip:
+            return False
+        if not self.game_window:
+            return False
+        # click() 期望屏幕坐标，内部会 ScreenToClient 后发后台消息
+        self.click(self.game_window[0] + 271, self.game_window[1] + 925, human_like=False)
+        time.sleep(0.5)
+        print(f"[技能] 已激活技能确认页，点底部文字区关闭 (标题={bool(title)}, 提示行={bool(tip)})")
+        return True
+
     def find_click_expedition_challenge(self):
         """判断能否点击远征挑战按钮"""
         self.click_first_template(
@@ -1779,22 +1801,30 @@ class GameBot:
             # find_click_return() 会误点到结算页"返回"而退出。故本模式独立处理
             # 导航/选技能/结算，continue 跳过下方所有通用逻辑。
             if self.mode == 5:
+                # 0) 每局开局都会弹「已激活技能」确认页：点下方文字区关闭。
+                #    点"下一关"后必然出现；不识别就会一直等，直到过渡超时误走首页导航。
+                if self.find_click_activated_skills():
+                    if self.element_after_next:
+                        self.element_after_next = False  # 已确认进入新一局
+                    self.element_pending_since = time.time()
+                    continue
                 # 1) 结算页最优先：只有约10秒窗口，且背景战斗画面有选技能残留模板
                 #    (实测0.70)，若先判选技能会在结算页误点、耗尽窗口。故先找"下一关"。
                 if self.find_click_element_next():
                     self.element_count += 1
-                    self.element_pending_battle = False
-                    self.element_pending_since = time.time()  # 借用计时：结算后过渡保护
+                    self.element_pending_battle = True
+                    self.element_after_next = True
+                    self.element_pending_since = time.time()
                     self.battle_count += 1
                     if self.on_battle_count_changed:
                         self.on_battle_count_changed(self.battle_count)
-                    print(f"[元素] 结算页点下一关，第 {self.element_count} 轮完成，等待回详情页")
-                    # 过渡保护：点下一关后页面需约2秒切回核心试炼详情页，
-                    # 中间态不匹配任何页面，若立即往下走会误触发导航回大厅。
-                    time.sleep(2.0)
+                    print(f"[元素] 结算页点下一关，第 {self.element_count} 轮完成，进入下一局过渡")
                     continue
                 # 2) 选技能界面（战斗中最常见，必须高频响应）
                 if self.find_click_skill_element():
+                    if self.element_after_next:
+                        self.element_after_next = False  # 已进入新一局的战斗
+                    self.element_pending_since = time.time()
                     continue
 
                 # 3) 待战斗状态：选技能/战斗/倒计时/结算期间一律不导航。
@@ -1803,12 +1833,23 @@ class GameBot:
                     # 若不在这里处理，下面的 continue 会让第4步永远轮不到 -> 卡死）。
                     if self.find_click_element_start():
                         print("[元素] 待战斗中点开始游戏，进入战斗")
+                        self.element_after_next = False  # 已进入新一局
                         continue
                     # 已回到核心试炼详情页 -> 本轮结束，清状态继续走下面步骤5点挑战
                     # 用低阈值：次数用完时按钮变灰也能识别，交给步骤5判定停止
                     if self.find_element_challenge_greyed():
                         self.element_pending_battle = False
+                        self.element_after_next = False
                         self.element_scroll_count = 0
+                    elif self.element_after_next:
+                        # 结算页点"下一关"后：游戏直接进入下一局，不经过详情页/
+                        # 开始弹窗。此时任何页面都可能正在加载，绝不能掉进导航。
+                        # 只在此等待(步骤2的选技能/步骤1的结算会在命中时接手)。
+                        if time.time() - self.element_pending_since > 180:
+                            print("[元素] 下一关过渡超时(180s)，重置状态重新导航")
+                            self.element_pending_battle = False
+                            self.element_after_next = False
+                        continue
                     else:
                         # 仍在战斗/加载中，超时兜底防止卡死
                         if time.time() - self.element_pending_since > 240:
