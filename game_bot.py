@@ -34,6 +34,7 @@ SKILL_LIST = [
     {"name": "无人机冲击", "template": ["skill-wrj.png", "skill-wrj-1.png"]},
     {"name": "跃迁电子", "template": ["skill-yq.png", "skill-yq-1.png"]},
     {"name": "空投轰炸", "template": ["skill-kt.png", "skill-kt-1.png"]},
+    {"name": "空间裂隙", "template": ["skill-kjlx.png", "skill-kjlx-1.png"]},
 ]
 
 
@@ -960,17 +961,107 @@ class GameBot:
         """判断能否点击继续战斗按钮"""
         self.click_template("auto-close.png")
 
+    def _abyss_card_offsets(self):
+        """4个卡位图标中心相对「选择技能」锚点的偏移（542x1010 客户区实测）。"""
+        return [(-195, 151), (-65, 151), (65, 151), (195, 151)]
+
+    def _abyss_client_centers(self, anchor_cx, anchor_cy):
+        """卡位中心：屏幕坐标 + 客户区坐标（截图坐标系）。"""
+        left = self.game_window[0] if self.game_window else 0
+        top = self.game_window[1] if self.game_window else 0
+        screen, client = [], []
+        for dx, dy in self._abyss_card_offsets():
+            sx, sy = anchor_cx + dx, anchor_cy + dy
+            screen.append((sx, sy))
+            client.append((int(sx - left), int(sy - top)))
+        return screen, client
+
+    def _abyss_detect_selected(self, img, client_centers):
+        """根据卡外圈橙金发光框判断是否已选中（比卡面亮度更稳）。"""
+        selected = []
+        h_img, w_img = img.shape[:2]
+        for cx, cy in client_centers:
+            x1, y1 = max(0, cx - 62), max(0, cy - 105)
+            x2, y2 = min(w_img, cx + 62), min(h_img, cy + 125)
+            crop = img[y1:y2, x1:x2]
+            if crop.size == 0:
+                selected.append(False)
+                continue
+            hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+            ch, cw = hsv.shape[:2]
+            frame = np.zeros((ch, cw), dtype=bool)
+            frame[:4, :] = True
+            frame[-4:, :] = True
+            frame[:, :4] = True
+            frame[:, -4:] = True
+            # 选中态外框：橙金色高亮；未选中几乎没有
+            mask = cv2.inRange(hsv, np.array([8, 120, 180]), np.array([30, 255, 255]))
+            ratio = float(((mask > 0) & frame).sum()) / max(int(frame.sum()), 1)
+            # 实测选中≈0.145，未选中≈0.01~0.03
+            selected.append(ratio >= 0.08)
+        return selected
+
+    def _match_templates_in_roi(self, img, cx, cy, templates, threshold=0.65):
+        """仅在卡位 ROI 内匹配模板，避免全屏误匹配战斗背景。"""
+        h_img, w_img = img.shape[:2]
+        x1, y1 = max(0, cx - 60), max(0, cy - 70)
+        x2, y2 = min(w_img, cx + 60), min(h_img, cy + 70)
+        roi = img[y1:y2, x1:x2]
+        if roi.size == 0:
+            return 0.0
+        best = 0.0
+        for name in templates:
+            if not name:
+                continue
+            if not name.endswith(".png"):
+                name = f"{name}.png"
+            if name in self.template_cache:
+                tmpl = self.template_cache[name]
+            else:
+                tmpl = cv2.imread(os.path.join(self.template_dir, name))
+                if tmpl is not None:
+                    self.template_cache[name] = tmpl
+            if tmpl is None:
+                continue
+            th, tw = tmpl.shape[:2]
+            rh, rw = roi.shape[:2]
+            if th > rh or tw > rw:
+                continue
+            res = cv2.matchTemplate(roi, tmpl, cv2.TM_CCOEFF_NORMED)
+            score = float(cv2.minMaxLoc(res)[1])
+            if score > best:
+                best = score
+        return best if best >= threshold else 0.0
+
+    def _abyss_preferred_slots(self, img, client_centers):
+        """按优先技能 → SKILL_LIST → 左到右，给 4 个卡位排序。"""
+        groups = []
+        for templates in self.priority_skills:
+            if templates:
+                groups.append(templates)
+        for skill in SKILL_LIST:
+            groups.append(skill["template"])
+
+        slot_rank = []
+        for slot, (cx, cy) in enumerate(client_centers):
+            rank = 999
+            score = 0.0
+            for prio_idx, templates in enumerate(groups):
+                s = self._match_templates_in_roi(img, cx, cy, templates)
+                if s > 0:
+                    rank = prio_idx
+                    score = s
+                    break
+            slot_rank.append((rank, -score, slot))
+        slot_rank.sort()
+        return [slot for _, __, slot in slot_rank]
+
     def find_click_skill_abyss(self):
-        """深渊专用选技能：4张卡选2张 + 点确定，循环直到界面消失。
+        """深渊专用选技能：4选2 + 点确定。
 
-        深渊的卡是普通技能，但选中态(金框/深蓝底)、强化态(强化数字+背景框)
-        会改变视觉，导致从普通态截的技能模板失配(实测大图模板仅0.3~0.45)。
-        因此改用固定卡位点击：4张卡位置固定，与视觉状态无关。
-
-        【重要】不要再用技能模板去匹配卡片：战斗中选技能时背景是战斗画面，
-        技能小图标(如skill-d-1.png)会以高分误匹配到画面空白处(实测0.872@(511,381))，
-        点击落空 -> 实际只选到1张 -> 底部停在"1/2确定" -> 卡在选技能界面反复循环。
-        所以这里100%用相对锚点的固定卡位，不依赖任何技能图像匹配。
+        固定卡位点击（选中态会改外观，全屏技能模板易误匹配背景）。
+        若已有卡被勾选，再点同一卡会取消，导致卡在 1/2。
+        因此先识别已选卡位，只点未选中的，并按技能优先级填满 2 张。
         """
         choose = self.find_template("choose-skill.png")
         if not choose:
@@ -978,30 +1069,51 @@ class GameBot:
         if not choose:
             return None
 
-        # find_template 返回的 choose 已经是"选择技能"锚点的中心点(屏幕坐标)，
-        # 不要再叠加模板宽高的一半。
         anchor_cx, anchor_cy = choose[0], choose[1]
+        screen_centers, client_centers = self._abyss_client_centers(anchor_cx, anchor_cy)
 
-        # 4个卡位图标中心相对锚点中心的偏移（实测 542x1010 客户区）
-        # 锚点中心客户区：开战前(280,459)/战斗中(280,342)，卡图标中心在锚点下方151px
-        # x 相对锚点：-195/-65/+65/+195 -> 客户区 85/215/345/475
-        card_offsets = [(-195, 151), (-65, 151), (65, 151), (195, 151)]
+        img = self.take_screenshot(force_new=True)
+        if img is None:
+            return choose
 
-        # 只用固定卡位点2张不同的卡（每轮进入都是全新"0/2"，卡位固定，点2张即可）
+        selected = self._abyss_detect_selected(img, client_centers)
+        selected_count = sum(1 for s in selected if s)
+        preferred = self._abyss_preferred_slots(img, client_centers)
+        print(
+            f"[深渊选技能] 已选位={selected} 共{selected_count} "
+            f"优先顺序={preferred}"
+        )
+
+        # 已满 2 张：只点确定
+        if selected_count >= 2:
+            confirm_x, confirm_y = anchor_cx - 8, anchor_cy + 410
+            self.click(confirm_x, confirm_y)
+            time.sleep(0.4)
+            print(f"[深渊选技能] 已满2张，直接确定 ({confirm_x},{confirm_y})")
+            return choose
+
+        need = 2 - selected_count
         picked = []
-        for dx, dy in card_offsets[:2]:
-            px, py = anchor_cx + dx, anchor_cy + dy
-            if self.match_log_enabled:
-                print(f"[深渊选技能] 点卡位 客户区偏移量({dx},{dy})")
+        for slot in preferred:
+            if need <= 0:
+                break
+            if selected[slot]:
+                continue
+            px, py = screen_centers[slot]
             self.click(px, py)
-            picked.append((px, py))
-            time.sleep(0.15)
+            picked.append((slot, px, py))
+            selected[slot] = True
+            need -= 1
+            # 点太快会丢点击/来不及刷新选中态，必须等稳
+            time.sleep(0.45)
 
-        # 点底部确定：锚点正下方偏左约8px、下移约410px
+        time.sleep(0.25)
         confirm_x, confirm_y = anchor_cx - 8, anchor_cy + 410
         self.click(confirm_x, confirm_y)
-        time.sleep(0.3)
-        print(f"[深渊选技能] 已选 {len(picked)} 张卡，点确定 @卡位{picked} 确定({confirm_x},{confirm_y})")
+        time.sleep(0.4)
+        print(
+            f"[深渊选技能] 新点{len(picked)}张{picked}，确定({confirm_x},{confirm_y})"
+        )
         return choose
 
     def find_click_skill_element(self):
@@ -1051,6 +1163,8 @@ class GameBot:
             if not choose_skill:
                 return None
 
+        matched = False
+
         # 首先检查4个优先技能
         for priority_skill_templates in self.priority_skills:
             if priority_skill_templates:
@@ -1062,6 +1176,7 @@ class GameBot:
                     skill_pos = self.find_template(template)
                     if skill_pos:
                         self.click(*skill_pos)
+                        matched = True
                         # time.sleep(0.1)
                         # return None
 
@@ -1074,8 +1189,24 @@ class GameBot:
                 skill_pos = self.find_template(template)
                 if skill_pos:
                     self.click(*skill_pos)
+                    matched = True
                     # time.sleep(0.1)
                     # return None
+
+        # 兜底：模板全未命中时按固定卡位点中间一张（主线/环球均为 3 选 1，点卡即生效）。
+        # 扫技能时截图可能已切走，先同帧复核仍在选技能页再点，避免战斗中误点。
+        if not matched:
+            self.take_screenshot(force_new=True)
+            still_choose = self.find_template("choose-skill.png") or self.find_template(
+                "choose-skill-1.png"
+            )
+            if not still_choose:
+                return None
+            anchor_cx, anchor_cy = still_choose
+            self.click(anchor_cx, anchor_cy + 278)
+            print(f"[选技能兜底] 模板未命中，固定点中间卡 ({anchor_cx},{anchor_cy + 278})")
+            time.sleep(0.2)
+            return still_choose
 
         return None
 
