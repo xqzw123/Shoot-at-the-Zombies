@@ -1063,6 +1063,9 @@ class GameBot:
     #       4选2 用0.72时0.93~0.98；用1.0则模板大于图标全不匹配。
     SKILL_TPL_SCALE = 0.72          # 4选2（保留兼容旧调用）
     SKILL_TPL_SCALE_PICK_ONE = 1.0  # 3选1
+    PICK_ONE_FLIP_WAIT = 1.0        # 3选1 等三张翻牌的总时长上限(秒，含抓帧耗时)
+    PICK_ONE_FLIP_INTERVAL = 0.2    # 未凑齐 3 张时的抓帧间隔(秒)
+    PICK_ONE_FRAME_BUDGET = 0.15    # 单帧截图+识别耗时预算(实测≈0.11s)，用于卡住总时长
 
     def _match_templates_in_roi(self, img, cx, cy, templates, threshold=0.65,
                                 scale=None, half_w=65, half_h=80, min_tpl_side=0):
@@ -1282,16 +1285,22 @@ class GameBot:
         band_roi=True(环球/主线)：用带状 ROI 罩住转盘翻牌前/后两套布局，只匹配大模板；
         band_roi=False(元素试炼)：沿用旧的 ±150/+278 点位与默认 ROI，行为不变。
 
-        速度：最多抓 3 帧(约0.8s)，识别到优先技能立即点。之前为"等转盘翻牌"固定
-        等 12×0.5=6s 并按帧存图，但翻牌后画面识别不出来是 ROI 点位/小模板误匹配
-        造成的，等再久也没有收益 —— 实测每轮都跑满 11 次重试后兜底点卡位0。
+        翻牌判断：等三张卡都识别出来再比优先级，总等待封顶 PICK_ONE_FLIP_WAIT(1s)。
+        实测单帧识别≈0.11s，1s 内可抓 5~7 帧；超时就按当前帧已识别的卡取 rank 最优，
+        不再像旧版那样固定等 12×0.5=6s 却因 ROI/模板问题一张都认不出。
         """
-        n_prio = len([p for p in self.priority_skills if p])
-        max_retry = 3
+        max_wait = self.PICK_ONE_FLIP_WAIT
+        flip_sleep = self.PICK_ONE_FLIP_INTERVAL
+        max_frames = 6  # 帧数保险；正常 1s 内约 5~7 帧，由时间上限兜底
         offsets = self._card_offsets_3_band_icon() if band_roi else self._card_offsets_3_icon()
         roi_half = (95, 115) if band_roi else None
         min_tpl_side = 60 if band_roi else 0
-        for attempt in range(max_retry):
+        t0 = time.monotonic()
+        deadline = t0 + max_wait
+        for attempt in range(max_frames):
+            # 预算不够再抓一帧时直接用上一帧的识别结果，避免总时长越过 max_wait
+            if attempt and time.monotonic() + self.PICK_ONE_FRAME_BUDGET > deadline:
+                break
             img = self.take_screenshot(force_new=True)
             if img is None:
                 return None
@@ -1306,15 +1315,19 @@ class GameBot:
                 img, icon_centers, scale=self.SKILL_TPL_SCALE_PICK_ONE,
                 return_detail=True, roi_half=roi_half, min_tpl_side=min_tpl_side,
             )
-            prio_hits = [d for d in detail if 0 <= d[1] < n_prio]
             any_hit = [d for d in detail if d[1] < 999]
-            if prio_hits:
+            hit_count = len(any_hit)
+            elapsed = time.monotonic() - t0
+            # 三张都翻开了 → 可以完整比较优先级
+            if hit_count >= 3:
                 break
-            if attempt < max_retry - 1:
-                if self.match_log_enabled:
-                    print(f"[{tag}] 未识别到优先技能(已识别{len(any_hit)}张)，重试 {attempt+1}/{max_retry-1}")
-                time.sleep(0.4)
+            if elapsed >= max_wait:
+                break
+            if self.match_log_enabled:
+                print(f"[{tag}] 第{attempt+1}帧已翻牌{hit_count}/3张，等其余翻牌 ({elapsed:.2f}s/{max_wait:.1f}s)")
+            time.sleep(min(flip_sleep, max(0.0, deadline - time.monotonic())))
 
+        elapsed = time.monotonic() - t0
         if not any_hit:
             # 三张全未识别才算异常，存一张供事后定位。"没有优先技能"是正常局面，不存图。
             self._save_skill_debug(img, tag, ax, ay, suffix="unrecognized")
@@ -1326,7 +1339,7 @@ class GameBot:
         self._click_client(cx, cy, press_delay=0.12)
         time.sleep(0.3)
         chosen = next((d[3] for d in detail if d[0] == slot), "?")
-        print(f"[{tag}] 3选1 识别{len(any_hit)}张 优先顺序={preferred} → 点卡位{slot}({chosen}) 客户区({cx},{cy})")
+        print(f"[{tag}] 3选1 翻牌{len(any_hit)}/3 等待{elapsed:.2f}s 优先顺序={preferred} → 点卡位{slot}({chosen}) 客户区({cx},{cy})")
         return (ax, ay)
 
     def _save_skill_debug(self, img, tag, ax, ay, suffix=""):
