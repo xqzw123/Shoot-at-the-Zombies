@@ -1260,10 +1260,13 @@ class GameBot:
         """
         n_prio = len([p for p in self.priority_skills if p])
         # 环球模式是「转盘抽技能」：标题 ay≈270 恒定，卡片先以灰色1/2/3占位符出现，
-        # 转盘停止后才翻牌成技能卡（翻牌后图标落在标题+278的位置，与元素试炼同一套点位）。
-        # 所以不能因 y=270 就退出——必须在同一轮内持续重抓，等翻牌后再判定点击。
-        # 倒计时约10秒，最多等 8×0.6s≈5s，仍无卡才兜底。
-        max_retry = 8
+        # 转盘停止后才翻牌成技能卡（实测转盘期可持续6秒以上）。旧版只等8×0.6=4.8s,
+        # 翻牌还没发生就兜底点了卡位0(恰好是低优先级) —— 这是"点了优先级外技能"的根因。
+        # 修复：等待窗口覆盖整个转盘期(约10秒)，且全未识别时绝不点卡位0。
+        max_retry = 20
+        # 固定间隔存图(第0/4/8/12/16帧)，覆盖整个转盘等待期。
+        # 之前只在"识别数变化"时存，而识别数恒为0时只存首帧(转盘期)，
+        # 导致翻牌后的真实画面从没被抓到——这是诊断盲点，不是游戏没有翻牌。
         for attempt in range(max_retry):
             img = self.take_screenshot(force_new=True)
             if img is None:
@@ -1279,22 +1282,25 @@ class GameBot:
                 img, icon_centers, scale=self.SKILL_TPL_SCALE_PICK_ONE, return_detail=True
             )
             prio_hits = [d for d in detail if 0 <= d[1] < n_prio]
-            unknown = [d for d in detail if d[1] >= 999]
-            if prio_hits or not unknown:
-                # 识别到优先技能，或三张全识别(确实没有优先技能可选) -> 可以点
+            any_hit = [d for d in detail if d[1] < 999]
+            hit_count = len(any_hit)
+            if attempt % 4 == 0:
+                self._save_skill_debug(img, tag, ax, ay, suffix=f"f{attempt:02d}_h{hit_count}")
+            if prio_hits or hit_count >= 2:
+                # 识别到优先技能，或至少2张卡翻牌成功 -> 可以判定点击
                 break
-            # 未翻牌(占位符)或未识别到优先技能：持续重抓等待转盘翻牌。
-            # 旧逻辑"有1张识别到就break"会在只识别出时空裂隙(rank19)时就点它，
-            # 而用户配置里根本没有时空裂隙。
-            if attempt == 0:
-                self._save_skill_debug(img, tag, ax, ay)
             if attempt < max_retry - 1:
                 if self.match_log_enabled:
-                    print(f"[{tag}] 等卡片翻牌/优先技能，已识别{3-len(unknown)}张，重试 {attempt+1}/{max_retry-1}")
-                time.sleep(0.6)
+                    print(f"[{tag}] 转盘期未翻牌，已识别{hit_count}张，标题y={ay}，重试 {attempt+1}/{max_retry-1}")
+                time.sleep(0.5)
+
+        # 重试耗尽仍不足2张识别：保存"耗尽帧"(翻牌后画面，便于下次定点位)。
+        # 仍要点一张，避免"技能不选、拖到倒计时结束"；若已存图可事后精修点位。
+        if len(any_hit) < 2:
+            self._save_skill_debug(img, tag, ax, ay, suffix="exhausted")
+            print(f"[{tag}] 转盘等待{int(max_retry*0.5)}s仅识别{len(any_hit)}张，诊断图已存，兜底点一张避免不选")
 
         # 兜底排序：优先技能 > 未识别卡 > 已识别的非优先技能。
-        # 未识别的可能是优先技能只是没匹配上(动画/模板差异)，比确定的低优先级卡更值得点。
         rank_by_slot = {d[0]: d[1] for d in detail}
 
         def _order(slot):
@@ -1309,15 +1315,14 @@ class GameBot:
         cx, cy = click_centers[slot]
         self._click_client(cx, cy, press_delay=0.12)
         time.sleep(0.3)
-        recognized_n = len([d for d in detail if d[1] < 999])
         chosen = next((d[3] for d in detail if d[0] == slot), "?")
-        print(f"[{tag}] 3选1 识别{recognized_n}张 优先顺序={preferred} → 点卡位{slot}({chosen}) 客户区({cx},{cy})")
+        print(f"[{tag}] 3选1 识别{len(any_hit)}张 优先顺序={preferred} → 点卡位{slot}({chosen}) 客户区({cx},{cy})")
         return (ax, ay)
 
-    def _save_skill_debug(self, img, tag, ax, ay):
-        """选技能全未识别时保存截图，便于事后诊断动画帧/布局问题。
+    def _save_skill_debug(self, img, tag, ax, ay, suffix=""):
+        """选技能识别异常时保存截图，便于事后诊断加载时序/布局问题。
 
-        文件名带模式号和 tag（如 m0_环球_选技能），避免不同模式截图混在一起无法区分。
+        文件名带模式号、tag、帧标记（如 m0_环球_选技能_first），不同模式/阶段一眼可区分。
         """
         try:
             os.makedirs(self.screenshot_dir, exist_ok=True)
@@ -1325,10 +1330,11 @@ class GameBot:
                 getattr(self, "mode", -1), f"m{getattr(self, 'mode', -1)}"
             )
             safe_tag = re.sub(r"[^\w\u4e00-\u9fff-]", "", str(tag))
-            name = f"skill_m{getattr(self, 'mode', -1)}_{mode_name}_{safe_tag}_{int(time.time())}.png"
+            safe_suffix = f"_{re.sub(r'[^\\w-]', '', str(suffix))}" if suffix else ""
+            name = f"skill_m{getattr(self, 'mode', -1)}_{mode_name}_{safe_tag}_{int(time.time())}{safe_suffix}.png"
             path = os.path.join(self.screenshot_dir, name)
             cv2.imwrite(path, img)
-            print(f"[{tag}] 全未识别，截图已保存: {path} (锚点客户区 y={ay})")
+            print(f"[{tag}] 诊断截图已保存: {path} (锚点客户区 y={ay})")
         except Exception as e:
             print(f"[{tag}] 保存诊断截图失败: {e}")
 
