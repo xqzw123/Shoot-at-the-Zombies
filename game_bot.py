@@ -996,8 +996,19 @@ class GameBot:
         return [(-195, 151), (-65, 151), (65, 151), (195, 151)]
 
     def _card_offsets_3_icon(self):
-        """3选1：图标中心相对锚点（用于 ROI 匹配优先级）。"""
+        """3选1：图标中心相对锚点（元素试炼布局，供 band_roi=False 使用）。"""
         return [(-150, 278), (0, 278), (150, 278)]
+
+    def _card_offsets_3_band_icon(self):
+        """环球/主线 3选1 转盘：带状 ROI 中心，兼容翻牌前/后两套布局。
+
+        实测(锚点 ay=270)：翻牌前小卡图标 y≈546(+276)，翻牌后大卡上移到 y≈480(+210)。
+        旧版固定 +278 只覆盖前者，翻牌后三张全部识别失败；且 ROI 宽仅 130px，
+        小于 1.0 缩放的大模板(128~142px)被整体跳过，只剩小图标乱匹配。
+        这里把中心放在两档中间 +243，配 half_h=115 覆盖 y≈398~628；
+        x 用 ±165（实测三张图标中心 98/278/461，ax≈280），配 half_w=95 完整罩住大卡。
+        """
+        return [(-165, 243), (0, 243), (165, 243)]
 
     def _card_offsets_3_click(self):
         """3选1：点击点相对锚点（文字区更易点中，元素实测 +345）。"""
@@ -1053,17 +1064,21 @@ class GameBot:
     SKILL_TPL_SCALE = 0.72          # 4选2（保留兼容旧调用）
     SKILL_TPL_SCALE_PICK_ONE = 1.0  # 3选1
 
-    def _match_templates_in_roi(self, img, cx, cy, templates, threshold=0.65, scale=None):
+    def _match_templates_in_roi(self, img, cx, cy, templates, threshold=0.65,
+                                scale=None, half_w=65, half_h=80, min_tpl_side=0):
         """仅在卡位 ROI 内匹配技能模板，避免全屏误匹配战斗背景。
 
         scale: 模板缩放比。3选1传1.0(图标≈原尺寸)、4选2传0.72(图标更小)；
                不传则用 SKILL_TPL_SCALE。缓存 key 带 scale，两种尺寸互不污染。
+        half_w/half_h: ROI 半宽/半高，默认 ±65/±80 是 4选2 原值，不要随意改。
+        min_tpl_side: 跳过(缩放后)短边小于该值的模板。3选1 传 60 可滤掉
+               25~35px 的战斗 HUD 小图标——它们会在大 ROI 里随机拿到 0.99 分。
         """
         if scale is None:
             scale = self.SKILL_TPL_SCALE
         h_img, w_img = img.shape[:2]
-        x1, y1 = max(0, cx - 65), max(0, cy - 80)
-        x2, y2 = min(w_img, cx + 65), min(h_img, cy + 80)
+        x1, y1 = max(0, cx - half_w), max(0, cy - half_h)
+        x2, y2 = min(w_img, cx + half_w), min(h_img, cy + half_h)
         roi = img[y1:y2, x1:x2]
         if roi.size == 0:
             return 0.0
@@ -1087,6 +1102,8 @@ class GameBot:
                 self.template_cache[cache_key] = tmpl
             th, tw = tmpl.shape[:2]
             rh, rw = roi.shape[:2]
+            if min(th, tw) < min_tpl_side:
+                continue
             if th > rh or tw > rw:
                 continue
             res = cv2.matchTemplate(roi, tmpl, cv2.TM_CCOEFF_NORMED)
@@ -1095,7 +1112,8 @@ class GameBot:
                 best = score
         return best if best >= threshold else 0.0
 
-    def _preferred_skill_slots(self, img, client_centers, scale=None, return_detail=False):
+    def _preferred_skill_slots(self, img, client_centers, scale=None,
+                               return_detail=False, roi_half=None, min_tpl_side=0):
         """全模式共用：按 优先技能 → SKILL_LIST → 左到右 给卡位排序。
 
         修复"出现时空裂隙后优先级失效"：
@@ -1113,10 +1131,14 @@ class GameBot:
             group_names.append(skill["name"])
 
         slot_rank, detail = [], []
+        half_w, half_h = roi_half if roi_half else (65, 80)
         for slot, (cx, cy) in enumerate(client_centers):
             rank, score, best_name = 999, 0.0, "未识别"
             for prio_idx, templates in enumerate(groups):
-                s = self._match_templates_in_roi(img, cx, cy, templates, scale=scale)
+                s = self._match_templates_in_roi(
+                    img, cx, cy, templates, scale=scale,
+                    half_w=half_w, half_h=half_h, min_tpl_side=min_tpl_side,
+                )
                 # 取最高分，而非首个命中：避免误匹配到靠前的优先技能就插队
                 if s > score:
                     rank, score, best_name = prio_idx, s, group_names[prio_idx]
@@ -1253,20 +1275,22 @@ class GameBot:
             print(f"[{tag}选技能] 本轮仍不足2张({count})，下轮再试 {picked}")
         return (ax, ay)
 
-    def find_click_skill_pick_one(self, tag="选技能", choose_threshold=0.8):
+    def find_click_skill_pick_one(self, tag="选技能", choose_threshold=0.8,
+                                  band_roi=True):
         """3选1 统一逻辑：卡位 ROI 按技能优先级排序，点排序第一的卡（点即生效）。
 
-        兜底顺序：优先技能 → 未识别卡 → 已识别的非优先技能。
+        band_roi=True(环球/主线)：用带状 ROI 罩住转盘翻牌前/后两套布局，只匹配大模板；
+        band_roi=False(元素试炼)：沿用旧的 ±150/+278 点位与默认 ROI，行为不变。
+
+        速度：最多抓 3 帧(约0.8s)，识别到优先技能立即点。之前为"等转盘翻牌"固定
+        等 12×0.5=6s 并按帧存图，但翻牌后画面识别不出来是 ROI 点位/小模板误匹配
+        造成的，等再久也没有收益 —— 实测每轮都跑满 11 次重试后兜底点卡位0。
         """
         n_prio = len([p for p in self.priority_skills if p])
-        # 环球模式是「转盘抽技能」：标题 ay≈270 恒定，卡片先以灰色1/2/3占位符出现，
-        # 转盘停止后才翻牌成技能卡（实测转盘期可持续6秒以上）。旧版只等8×0.6=4.8s,
-        # 翻牌还没发生就兜底点了卡位0(恰好是低优先级) —— 这是"点了优先级外技能"的根因。
-        # 修复：等待窗口覆盖整个转盘期(约10秒)，且全未识别时绝不点卡位0。
-        max_retry = 20
-        # 固定间隔存图(第0/4/8/12/16帧)，覆盖整个转盘等待期。
-        # 之前只在"识别数变化"时存，而识别数恒为0时只存首帧(转盘期)，
-        # 导致翻牌后的真实画面从没被抓到——这是诊断盲点，不是游戏没有翻牌。
+        max_retry = 3
+        offsets = self._card_offsets_3_band_icon() if band_roi else self._card_offsets_3_icon()
+        roi_half = (95, 115) if band_roi else None
+        min_tpl_side = 60 if band_roi else 0
         for attempt in range(max_retry):
             img = self.take_screenshot(force_new=True)
             if img is None:
@@ -1275,43 +1299,29 @@ class GameBot:
             if not client_anchor:
                 return None
             ax, ay = client_anchor
-            icon_centers = [(ax + dx, ay + dy) for dx, dy in self._card_offsets_3_icon()]
+            icon_centers = [(ax + dx, ay + dy) for dx, dy in offsets]
             click_centers = [(ax + dx, ay + dy) for dx, dy in self._card_offsets_3_click()]
-            # 3选1 图标≈原模板尺寸(实测空间裂隙1.0匹配0.99)，必须用1.0缩放
+            # 3选1 卡面是大图标：必须 scale=1.0，并滤掉 25~35px 的 HUD 小图标。
             preferred, detail = self._preferred_skill_slots(
-                img, icon_centers, scale=self.SKILL_TPL_SCALE_PICK_ONE, return_detail=True
+                img, icon_centers, scale=self.SKILL_TPL_SCALE_PICK_ONE,
+                return_detail=True, roi_half=roi_half, min_tpl_side=min_tpl_side,
             )
             prio_hits = [d for d in detail if 0 <= d[1] < n_prio]
             any_hit = [d for d in detail if d[1] < 999]
-            hit_count = len(any_hit)
-            if attempt % 4 == 0:
-                self._save_skill_debug(img, tag, ax, ay, suffix=f"f{attempt:02d}_h{hit_count}")
-            if prio_hits or hit_count >= 2:
-                # 识别到优先技能，或至少2张卡翻牌成功 -> 可以判定点击
+            if prio_hits:
                 break
             if attempt < max_retry - 1:
                 if self.match_log_enabled:
-                    print(f"[{tag}] 转盘期未翻牌，已识别{hit_count}张，标题y={ay}，重试 {attempt+1}/{max_retry-1}")
-                time.sleep(0.5)
+                    print(f"[{tag}] 未识别到优先技能(已识别{len(any_hit)}张)，重试 {attempt+1}/{max_retry-1}")
+                time.sleep(0.4)
 
-        # 重试耗尽仍不足2张识别：保存"耗尽帧"(翻牌后画面，便于下次定点位)。
-        # 仍要点一张，避免"技能不选、拖到倒计时结束"；若已存图可事后精修点位。
-        if len(any_hit) < 2:
-            self._save_skill_debug(img, tag, ax, ay, suffix="exhausted")
-            print(f"[{tag}] 转盘等待{int(max_retry*0.5)}s仅识别{len(any_hit)}张，诊断图已存，兜底点一张避免不选")
+        if not any_hit:
+            # 三张全未识别才算异常，存一张供事后定位。"没有优先技能"是正常局面，不存图。
+            self._save_skill_debug(img, tag, ax, ay, suffix="unrecognized")
 
-        # 兜底排序：优先技能 > 未识别卡 > 已识别的非优先技能。
-        rank_by_slot = {d[0]: d[1] for d in detail}
-
-        def _order(slot):
-            r = rank_by_slot.get(slot, 999)
-            if 0 <= r < n_prio:
-                return (0, r, slot)      # 优先技能最前
-            if r >= 999:
-                return (1, 0, slot)      # 未识别卡次之
-            return (2, r, slot)          # 已识别的非优先技能最后
-
-        slot = min(preferred, key=_order)
+        # preferred 已按 rank 升序（优先技能 → SKILL_LIST → 未识别），取第一张即可。
+        # 旧的 _order 把"未识别卡"排到已识别卡之前，会把明明识别到的技能挤掉。
+        slot = preferred[0]
         cx, cy = click_centers[slot]
         self._click_client(cx, cy, press_delay=0.12)
         time.sleep(0.3)
@@ -1330,7 +1340,7 @@ class GameBot:
                 getattr(self, "mode", -1), f"m{getattr(self, 'mode', -1)}"
             )
             safe_tag = re.sub(r"[^\w\u4e00-\u9fff-]", "", str(tag))
-            safe_suffix = f"_{re.sub(r'[^\\w-]', '', str(suffix))}" if suffix else ""
+            safe_suffix = f"_{re.sub(r'[^\w-]', '', str(suffix))}" if suffix else ""
             name = f"skill_m{getattr(self, 'mode', -1)}_{mode_name}_{safe_tag}_{int(time.time())}{safe_suffix}.png"
             path = os.path.join(self.screenshot_dir, name)
             cv2.imwrite(path, img)
@@ -1354,7 +1364,7 @@ class GameBot:
         if ay > 280:
             # 4选2：与深渊同一套优先级+按钮张数逻辑（火焰标题用 0.55）
             return self.find_click_skill_abyss(tag="元素", choose_threshold=0.55)
-        return self.find_click_skill_pick_one(tag="元素", choose_threshold=0.55)
+        return self.find_click_skill_pick_one(tag="元素", choose_threshold=0.55, band_roi=False)
 
     def find_click_skill(self):
         """选技能总入口：所有模式统一按技能优先级选卡。"""
