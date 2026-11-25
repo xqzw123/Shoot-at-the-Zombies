@@ -1092,27 +1092,44 @@ class GameBot:
         return best if best >= threshold else 0.0
 
     def _preferred_skill_slots(self, img, client_centers):
-        """全模式共用：按 优先技能 → SKILL_LIST → 左到右 给卡位排序。"""
-        groups = []
+        """全模式共用：按 优先技能 → SKILL_LIST → 左到右 给卡位排序。
+
+        修复"出现时空裂隙后优先级失效"：
+        旧逻辑对每个卡位取"首个超过阈值的技能组"，蓝色系技能互相误匹配时
+        (实测时空裂隙卡↔跃迁电子 0.673、电极柱卡↔枪械 0.676 均过 0.65 阈值)
+        会插到高优先级、压掉真正该选的卡。改为取"匹配分最高的技能组"，
+        真匹配(0.9+)自然压过误匹配(0.6~0.75)。
+        """
+        groups, group_names = [], []
         for templates in self.priority_skills:
             if templates:
                 groups.append(templates)
+                group_names.append(self._skill_name_of(templates))
         for skill in SKILL_LIST:
             groups.append(skill["template"])
+            group_names.append(skill["name"])
 
         slot_rank = []
         for slot, (cx, cy) in enumerate(client_centers):
-            rank = 999
-            score = 0.0
+            rank, score, best_name = 999, 0.0, "未识别"
             for prio_idx, templates in enumerate(groups):
                 s = self._match_templates_in_roi(img, cx, cy, templates)
-                if s > 0:
-                    rank = prio_idx
-                    score = s
-                    break
+                # 取最高分，而非首个命中：避免误匹配到靠前的优先技能就插队
+                if s > score:
+                    rank, score, best_name = prio_idx, s, group_names[prio_idx]
             slot_rank.append((rank, -score, slot))
+            if self.match_log_enabled:
+                print(f"[选技能] 卡{slot} 识别={best_name}({score:.2f}) rank={rank}")
         slot_rank.sort()
         return [slot for _, __, slot in slot_rank]
+
+    @staticmethod
+    def _skill_name_of(templates):
+        """模板列表 -> 技能中文名（仅用于诊断日志）。"""
+        for skill in SKILL_LIST:
+            if skill["template"] == templates:
+                return skill["name"]
+        return str(templates[0]) if templates else "?"
 
     def _match_choose_skill_client(self, img, threshold=0.8):
         """在截图（客户区坐标系）上找「选择技能」锚点中心，返回 (cx,cy) 或 None。"""
