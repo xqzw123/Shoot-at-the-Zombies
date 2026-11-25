@@ -20,10 +20,14 @@ from tkinter import ttk, messagebox, scrolledtext
 import threading
 
 SKILL_LIST = [
-    {"name": "枪械", "template": ["skill.png", "skill-1.png"]},
+    # 同一技能的不同图标版本放同一组（含衍生词条）：
+    # 枪械=连发+/子弹爆炸+/急冻子弹+/生化学弹，空投轰炸=连续轰炸(+)/轰炸震荡/精准打击，
+    # 时空裂隙=裂隙扩张+/多重坍塌/坍塌增幅，迷雾之触=迅捷化，生化矩阵=矩阵裂变，
+    # 多维弹球=弹球连发。衍生卡与主技能共用图标，图像匹配无法区分，按同一优先级处理。
+    {"name": "枪械", "template": ["skill.png", "skill-1.png", "skill-qx-2.png"]},
     {"name": "温压弹", "template": ["skill-wyd.png", "skill-wyd-1.png"]},
     {"name": "干冰弹", "template": ["skill-gbd.png", "skill-gbd-1.png"]},
-    {"name": "冰雹发生器", "template": ["skill-bb.png", "skill-bb-1.png"]},
+    {"name": "冰暴发生器", "template": ["skill-bb.png", "skill-bb-1.png"]},
     {"name": "装甲车", "template": ["skill-c.png", "skill-c-1.png"]},
     {"name": "电磁穿刺", "template": ["skill-d.png", "skill-d-1.png"]},
     {"name": "压缩气刃", "template": ["skill-fr.png", "skill-fr-1.png"]},
@@ -33,8 +37,14 @@ SKILL_LIST = [
     {"name": "高能射线", "template": ["skill-sx.png", "skill-sx-1.png"]},
     {"name": "无人机冲击", "template": ["skill-wrj.png", "skill-wrj-1.png"]},
     {"name": "跃迁电子", "template": ["skill-yq.png", "skill-yq-1.png"]},
-    {"name": "空投轰炸", "template": ["skill-kt.png", "skill-kt-1.png"]},
-    {"name": "空间裂隙", "template": ["skill-kjlx.png", "skill-kjlx-1.png"]},
+    {"name": "空投轰炸", "template": ["skill-kt.png", "skill-kt-1.png", "skill-kt-2.png",
+                                 "skill-kt-gold-1.png", "skill-kt-gold-2.png"]},
+    {"name": "时空裂隙", "template": ["skill-kjlx.png", "skill-kjlx-1.png"]},
+    {"name": "电极柱", "template": ["skill-djz.png"]},
+    {"name": "生化矩阵", "template": ["skill-swjz.png"]},
+    {"name": "迷雾之触", "template": ["skill-mwzc.png"]},
+    {"name": "冰筑龙体", "template": ["skill-bzlt.png"]},
+    {"name": "多维弹球", "template": ["skill-dwdq.png"]},
 ]
 
 
@@ -1059,7 +1069,7 @@ class GameBot:
         return best_n
 
     # 3选1 卡图标大(≈原图尺寸)，4选2 卡图标小(≈原图0.72倍)，缩放按场景传参。
-    # 实测：3选1 用1.0时空间裂隙0.99/温压弹0.83；用0.72则全部0.47漏匹配。
+    # 实测：3选1 用1.0时时空裂隙0.99/温压弹0.83；用0.72则全部0.47漏匹配。
     #       4选2 用0.72时0.93~0.98；用1.0则模板大于图标全不匹配。
     SKILL_TPL_SCALE = 0.72          # 4选2（保留兼容旧调用）
     SKILL_TPL_SCALE_PICK_ONE = 1.0  # 3选1
@@ -1116,13 +1126,18 @@ class GameBot:
         return best if best >= threshold else 0.0
 
     def _preferred_skill_slots(self, img, client_centers, scale=None,
-                               return_detail=False, roi_half=None, min_tpl_side=0):
+                               return_detail=False, roi_half=None, min_tpl_side=60):
         """全模式共用：按 优先技能 → SKILL_LIST → 左到右 给卡位排序。
 
         修复"出现时空裂隙后优先级失效"：
         1) 取"匹配分最高的技能组"而非首个过阈值，避免误匹配插队。
         2) 3选1 图标比4选2大，必须传 scale=1.0；否则全用0.72会全"未识别"
            → 退化成从左到右点第一张(3选1优先级失效的真正根因)。
+        3) 默认值按 4选2 实测调整：ROI ±95/115、滤掉 25~35px 的 -1 小模板。
+           实测 4 张 4选2 截图(16 张卡)全部识别；金色「连续轰炸+」卡在原
+           ±65/80 下只能靠 skill-kt-1.png 小模板拿 0.81，加宽后由
+           skill-kt-gold-1.png 拿 0.96，不再依赖小模板误匹配。
+           3选1 仍显式传 scale=1.0 / roi_half=(95,115) / min_tpl_side=60。
         """
         groups, group_names = [], []
         for templates in self.priority_skills:
@@ -1134,7 +1149,7 @@ class GameBot:
             group_names.append(skill["name"])
 
         slot_rank, detail = [], []
-        half_w, half_h = roi_half if roi_half else (65, 80)
+        half_w, half_h = roi_half if roi_half else (95, 115)
         for slot, (cx, cy) in enumerate(client_centers):
             rank, score, best_name = 999, 0.0, "未识别"
             for prio_idx, templates in enumerate(groups):
