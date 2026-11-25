@@ -1046,17 +1046,20 @@ class GameBot:
             return 0
         return best_n
 
-    # 技能模板取自更大的卡面特写(图标直径≈85px)，而选技能界面的卡图标≈60px。
-    # 实测模板缩放 0.70~0.75 时匹配分 0.93~0.98，1.0 原尺寸则全部<0.01(根本匹配不到)。
-    SKILL_TPL_SCALE = 0.72
+    # 3选1 卡图标大(≈原图尺寸)，4选2 卡图标小(≈原图0.72倍)，缩放按场景传参。
+    # 实测：3选1 用1.0时空间裂隙0.99/温压弹0.83；用0.72则全部0.47漏匹配。
+    #       4选2 用0.72时0.93~0.98；用1.0则模板大于图标全不匹配。
+    SKILL_TPL_SCALE = 0.72          # 4选2（保留兼容旧调用）
+    SKILL_TPL_SCALE_PICK_ONE = 1.0  # 3选1
 
-    def _match_templates_in_roi(self, img, cx, cy, templates, threshold=0.65):
+    def _match_templates_in_roi(self, img, cx, cy, templates, threshold=0.65, scale=None):
         """仅在卡位 ROI 内匹配技能模板，避免全屏误匹配战斗背景。
 
-        关键：模板需按 SKILL_TPL_SCALE 缩放后才能匹配当前界面的卡图标，
-        否则原尺寸(136x128)大于ROI且图标尺度不符，全部漏匹配 -> 优先级失效、
-        退化成从左到右固定点。缩放后的模板缓存复用，避免每卡重复 resize。
+        scale: 模板缩放比。3选1传1.0(图标≈原尺寸)、4选2传0.72(图标更小)；
+               不传则用 SKILL_TPL_SCALE。缓存 key 带 scale，两种尺寸互不污染。
         """
+        if scale is None:
+            scale = self.SKILL_TPL_SCALE
         h_img, w_img = img.shape[:2]
         x1, y1 = max(0, cx - 65), max(0, cy - 80)
         x2, y2 = min(w_img, cx + 65), min(h_img, cy + 80)
@@ -1069,7 +1072,7 @@ class GameBot:
                 continue
             if not name.endswith(".png"):
                 name = f"{name}.png"
-            cache_key = f"scaled:{name}"
+            cache_key = f"scaled:{scale}:{name}"
             if cache_key in self.template_cache:
                 tmpl = self.template_cache[cache_key]
             else:
@@ -1077,7 +1080,7 @@ class GameBot:
                 if raw is None:
                     continue
                 tmpl = cv2.resize(
-                    raw, None, fx=self.SKILL_TPL_SCALE, fy=self.SKILL_TPL_SCALE,
+                    raw, None, fx=scale, fy=scale,
                     interpolation=cv2.INTER_AREA,
                 )
                 self.template_cache[cache_key] = tmpl
@@ -1091,14 +1094,13 @@ class GameBot:
                 best = score
         return best if best >= threshold else 0.0
 
-    def _preferred_skill_slots(self, img, client_centers):
+    def _preferred_skill_slots(self, img, client_centers, scale=None):
         """全模式共用：按 优先技能 → SKILL_LIST → 左到右 给卡位排序。
 
         修复"出现时空裂隙后优先级失效"：
-        旧逻辑对每个卡位取"首个超过阈值的技能组"，蓝色系技能互相误匹配时
-        (实测时空裂隙卡↔跃迁电子 0.673、电极柱卡↔枪械 0.676 均过 0.65 阈值)
-        会插到高优先级、压掉真正该选的卡。改为取"匹配分最高的技能组"，
-        真匹配(0.9+)自然压过误匹配(0.6~0.75)。
+        1) 取"匹配分最高的技能组"而非首个过阈值，避免误匹配插队。
+        2) 3选1 图标比4选2大，必须传 scale=1.0；否则全用0.72会全"未识别"
+           → 退化成从左到右点第一张(3选1优先级失效的真正根因)。
         """
         groups, group_names = [], []
         for templates in self.priority_skills:
@@ -1113,7 +1115,7 @@ class GameBot:
         for slot, (cx, cy) in enumerate(client_centers):
             rank, score, best_name = 999, 0.0, "未识别"
             for prio_idx, templates in enumerate(groups):
-                s = self._match_templates_in_roi(img, cx, cy, templates)
+                s = self._match_templates_in_roi(img, cx, cy, templates, scale=scale)
                 # 取最高分，而非首个命中：避免误匹配到靠前的优先技能就插队
                 if s > score:
                     rank, score, best_name = prio_idx, s, group_names[prio_idx]
@@ -1260,7 +1262,10 @@ class GameBot:
         ax, ay = client_anchor
         icon_centers = [(ax + dx, ay + dy) for dx, dy in self._card_offsets_3_icon()]
         click_centers = [(ax + dx, ay + dy) for dx, dy in self._card_offsets_3_click()]
-        preferred = self._preferred_skill_slots(img, icon_centers)
+        # 3选1 图标≈原模板尺寸(实测空间裂隙1.0匹配0.99)，必须用1.0缩放
+        preferred = self._preferred_skill_slots(
+            img, icon_centers, scale=self.SKILL_TPL_SCALE_PICK_ONE
+        )
         slot = preferred[0]
         cx, cy = click_centers[slot]
         self._click_client(cx, cy, press_delay=0.12)
