@@ -175,9 +175,30 @@ class GameBot:
         self.hwnd = win32gui.FindWindow(None, self.game_title)
         return self.hwnd
 
-    def _post_mouse(self, x, y, msg, wparam):
-        """向游戏窗口客户区发送鼠标消息（屏幕坐标 -> 客户区坐标）"""
+    def _get_click_hwnd(self):
+        """点击目标窗口：优先 Chrome 渲染子窗口（微信小程序实际收鼠标消息的层）。"""
         hwnd = self._get_hwnd()
+        if not hwnd:
+            return None
+        chrome = None
+
+        def _enum(h, _):
+            nonlocal chrome
+            try:
+                if win32gui.GetClassName(h) == "Chrome_RenderWidgetHostHWND":
+                    chrome = h
+            except Exception:
+                pass
+
+        try:
+            win32gui.EnumChildWindows(hwnd, _enum, None)
+        except Exception:
+            pass
+        return chrome or hwnd
+
+    def _post_mouse(self, x, y, msg, wparam):
+        """向游戏窗口客户区发送鼠标消息（屏幕坐标 -> 客户区坐标，不移动真实鼠标）"""
+        hwnd = self._get_click_hwnd()
         if not hwnd:
             return
         client_x, client_y = win32gui.ScreenToClient(hwnd, (int(x), int(y)))
@@ -964,45 +985,61 @@ class GameBot:
         """判断能否点击继续战斗按钮"""
         self.click_template("auto-close.png")
 
-    def _abyss_card_offsets(self):
-        """4个卡位图标中心相对「选择技能」锚点的偏移（542x1010 客户区实测）。"""
+    def _card_offsets_4(self):
+        """4选2：卡位图标中心相对「选择技能」锚点（542x1010 实测）。"""
         return [(-195, 151), (-65, 151), (65, 151), (195, 151)]
 
-    def _abyss_client_centers(self, anchor_cx, anchor_cy):
-        """卡位中心：屏幕坐标 + 客户区坐标（截图坐标系）。"""
-        left = self.game_window[0] if self.game_window else 0
-        top = self.game_window[1] if self.game_window else 0
-        screen, client = [], []
-        for dx, dy in self._abyss_card_offsets():
-            sx, sy = anchor_cx + dx, anchor_cy + dy
-            screen.append((sx, sy))
-            client.append((int(sx - left), int(sy - top)))
-        return screen, client
+    def _card_offsets_3_icon(self):
+        """3选1：图标中心相对锚点（用于 ROI 匹配优先级）。"""
+        return [(-150, 278), (0, 278), (150, 278)]
 
-    def _abyss_detect_selected(self, img, client_centers):
-        """根据卡外圈橙金发光框判断是否已选中（比卡面亮度更稳）。"""
-        selected = []
+    def _card_offsets_3_click(self):
+        """3选1：点击点相对锚点（文字区更易点中，元素实测 +345）。"""
+        return [(-150, 345), (0, 345), (150, 345)]
+
+    def _abyss_selection_count(self, img, anchor_cx_client, anchor_cy_client):
+        """用底部确定按钮上的「0/2」「1/2」「2/2」文字判断已选张数。
+
+        金框=技能强化特效，不能当选中态。
+        注意：没有 0of2 时，「0/2」会更像「2/2」(实测 0.93) 而被误判已满，
+        从而对灰掉的确定按钮空点卡住——必须三态一起比。
+        """
+        ax, ay = int(anchor_cx_client), int(anchor_cy_client)
+        bx, by = ax - 8, ay + 410
         h_img, w_img = img.shape[:2]
-        for cx, cy in client_centers:
-            x1, y1 = max(0, cx - 62), max(0, cy - 105)
-            x2, y2 = min(w_img, cx + 62), min(h_img, cy + 125)
-            crop = img[y1:y2, x1:x2]
-            if crop.size == 0:
-                selected.append(False)
+        x1, y1 = max(0, bx - 130), max(0, by - 40)
+        x2, y2 = min(w_img, bx + 130), min(h_img, by + 40)
+        roi = img[y1:y2, x1:x2]
+        if roi.size == 0:
+            return 0
+
+        scores = {}
+        for n, name in (
+            (0, "abyss-skill-0of2.png"),
+            (1, "abyss-skill-1of2.png"),
+            (2, "abyss-skill-2of2.png"),
+        ):
+            if name in self.template_cache:
+                tmpl = self.template_cache[name]
+            else:
+                tmpl = cv2.imread(os.path.join(self.template_dir, name))
+                if tmpl is not None:
+                    self.template_cache[name] = tmpl
+            if tmpl is None:
+                scores[n] = 0.0
                 continue
-            hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-            ch, cw = hsv.shape[:2]
-            frame = np.zeros((ch, cw), dtype=bool)
-            frame[:4, :] = True
-            frame[-4:, :] = True
-            frame[:, :4] = True
-            frame[:, -4:] = True
-            # 选中态外框：橙金色高亮；未选中几乎没有
-            mask = cv2.inRange(hsv, np.array([8, 120, 180]), np.array([30, 255, 255]))
-            ratio = float(((mask > 0) & frame).sum()) / max(int(frame.sum()), 1)
-            # 实测选中≈0.145，未选中≈0.01~0.03
-            selected.append(ratio >= 0.08)
-        return selected
+            th, tw = tmpl.shape[:2]
+            rh, rw = roi.shape[:2]
+            if th > rh or tw > rw:
+                scores[n] = 0.0
+                continue
+            res = cv2.matchTemplate(roi, tmpl, cv2.TM_CCOEFF_NORMED)
+            scores[n] = float(cv2.minMaxLoc(res)[1])
+
+        best_n, best_s = max(scores.items(), key=lambda kv: kv[1])
+        if best_s < 0.90:
+            return 0
+        return best_n
 
     # 技能模板取自更大的卡面特写(图标直径≈85px)，而选技能界面的卡图标≈60px。
     # 实测模板缩放 0.70~0.75 时匹配分 0.93~0.98，1.0 原尺寸则全部<0.01(根本匹配不到)。
@@ -1049,8 +1086,8 @@ class GameBot:
                 best = score
         return best if best >= threshold else 0.0
 
-    def _abyss_preferred_slots(self, img, client_centers):
-        """按优先技能 → SKILL_LIST → 左到右，给 4 个卡位排序。"""
+    def _preferred_skill_slots(self, img, client_centers):
+        """全模式共用：按 优先技能 → SKILL_LIST → 左到右 给卡位排序。"""
         groups = []
         for templates in self.priority_skills:
             if templates:
@@ -1072,163 +1109,170 @@ class GameBot:
         slot_rank.sort()
         return [slot for _, __, slot in slot_rank]
 
-    def find_click_skill_abyss(self, anchor=None, tag="深渊"):
-        """深渊/元素试炼共用的 4选2 选技能：先识别已选卡位，再补点，避免重复点击取消。
+    def _match_choose_skill_client(self, img, threshold=0.8):
+        """在截图（客户区坐标系）上找「选择技能」锚点中心，返回 (cx,cy) 或 None。"""
+        best = None
+        for name in ("choose-skill.png", "choose-skill-1.png"):
+            if name in self.template_cache:
+                tmpl = self.template_cache[name]
+            else:
+                tmpl = cv2.imread(os.path.join(self.template_dir, name))
+                if tmpl is not None:
+                    self.template_cache[name] = tmpl
+            if tmpl is None:
+                continue
+            th, tw = tmpl.shape[:2]
+            ih, iw = img.shape[:2]
+            if th > ih or tw > iw:
+                continue
+            res = cv2.matchTemplate(img, tmpl, cv2.TM_CCOEFF_NORMED)
+            max_val = float(cv2.minMaxLoc(res)[1])
+            max_loc = cv2.minMaxLoc(res)[3]
+            if max_val >= threshold and (best is None or max_val > best[0]):
+                best = (max_val, max_loc[0] + tw // 2, max_loc[1] + th // 2)
+        if not best:
+            return None
+        return (best[1], best[2])
 
-        固定卡位点击（选中态会改外观，全屏技能模板易误匹配背景）。
-        若已有卡被勾选，再点同一卡会取消，导致卡在 1/2。
-        因此先识别已选卡位，只点未选中的，并按技能优先级填满 2 张。
+    def _click_client(self, cx, cy, press_delay=0.12):
+        """客户区坐标 → 当前窗口实时屏幕坐标再后台点击（避免藏窗后仍用旧屏幕坐标）。"""
+        hwnd = self._get_hwnd()
+        if not hwnd:
+            return
+        sx, sy = win32gui.ClientToScreen(hwnd, (int(cx), int(cy)))
+        if self.background_mode:
+            self._post_click(sx, sy, press_delay=press_delay)
+        else:
+            self.click(sx, sy, human_like=False)
 
-        anchor: 可选的「选择技能」锚点(屏幕坐标)。元素试炼火焰帧匹配分波动，
-                需外部用 0.55 阈值找到后传入，避免此处 0.8 默认阈值漏匹配。
+    def find_click_skill_abyss(self, anchor=None, tag="深渊", choose_threshold=None):
+        """深渊/元素试炼共用的 4选2 选技能（按技能优先级选卡）。
+
+        已选张数看底部按钮「0/2」「1/2」「2/2」（金框=强化特效不能当选中）。
+        点卡后复核张数：增加=选中；减少=点到已选被取消，点回并跳过。
+        全程客户区坐标 + 点击时 ClientToScreen，后台 PostMessage，不挪真实鼠标。
+
+        anchor: 可选的「选择技能」锚点(屏幕坐标)，匹配失败时回退换算。
+        choose_threshold: 标题匹配阈值；默认深渊0.8、传入anchor时0.55（元素火焰帧）。
         tag: 日志前缀，区分深渊/元素。
         """
-        choose = anchor
-        if not choose:
-            choose = self.find_template("choose-skill.png")
-            if not choose:
-                choose = self.find_template("choose-skill-1.png")
-        if not choose:
-            return None
-
-        anchor_cx, anchor_cy = choose[0], choose[1]
-        screen_centers, client_centers = self._abyss_client_centers(anchor_cx, anchor_cy)
-
         img = self.take_screenshot(force_new=True)
         if img is None:
-            return choose
-
-        selected = self._abyss_detect_selected(img, client_centers)
-        selected_count = sum(1 for s in selected if s)
-        preferred = self._abyss_preferred_slots(img, client_centers)
-        print(
-            f"[{tag}选技能] 已选位={selected} 共{selected_count} "
-            f"优先顺序={preferred}"
-        )
-
-        # 已满 2 张：只点确定
-        if selected_count >= 2:
-            confirm_x, confirm_y = anchor_cx - 8, anchor_cy + 410
-            self.click(confirm_x, confirm_y)
-            time.sleep(0.4)
-            print(f"[{tag}选技能] 已满2张，直接确定 ({confirm_x},{confirm_y})")
-            return choose
-
-        need = 2 - selected_count
-        picked = []
-        for slot in preferred:
-            if need <= 0:
-                break
-            if selected[slot]:
-                continue
-            px, py = screen_centers[slot]
-            self.click(px, py)
-            picked.append((slot, px, py))
-            selected[slot] = True
-            need -= 1
-            # 点太快会丢点击/来不及刷新选中态，必须等稳
-            time.sleep(0.45)
-
-        time.sleep(0.25)
-        confirm_x, confirm_y = anchor_cx - 8, anchor_cy + 410
-        self.click(confirm_x, confirm_y)
-        time.sleep(0.4)
-        print(
-            f"[{tag}选技能] 新点{len(picked)}张{picked}，确定({confirm_x},{confirm_y})"
-        )
-        return choose
-
-    def find_click_skill_element(self):
-        """元素试炼专用选技能：前5轮4选2、第6轮起3选1。
-        两种布局靠"选择技能"标题中心 y 区分（客户区）：
-          4选2 标题中心 y≈342，卡图标 y≈490，确定按钮 y≈748
-          3选1 标题中心 y≈205，卡图标 y≈485，文字 y≈570，点卡直接生效(无确定)
-        标题模板火焰动画帧会导致匹配分 0.6~0.96 波动，故阈值取 0.55。
-        """
-        choose = self.find_template("choose-skill.png", threshold=0.55)
-        if not choose:
-            choose = self.find_template("choose-skill-1.png", threshold=0.55)
-        if not choose:
             return None
 
-        # find_template 返回屏幕坐标；换算回客户区 y 判断布局
-        client_y = choose[1] - self.game_window[1] if self.game_window else choose[1]
-        anchor_cx, anchor_cy = choose[0], choose[1]
+        if choose_threshold is None:
+            choose_threshold = 0.55 if anchor is not None else 0.8
+        client_anchor = self._match_choose_skill_client(img, threshold=choose_threshold)
+        if not client_anchor and anchor and self.game_window:
+            client_anchor = (
+                int(anchor[0] - self.game_window[0]),
+                int(anchor[1] - self.game_window[1]),
+            )
+        if not client_anchor:
+            return None
 
-        if client_y > 280:
-            # 4选2：复用深渊已验证的「识别已选→补点→确定」逻辑，
-            # 避免旧版每轮固定点前两张、点太快导致停在 1/2 反复循环。
-            # 传入本方法用 0.55 阈值找到的锚点(火焰帧默认0.8会漏匹配)。
-            return self.find_click_skill_abyss(anchor=choose, tag="元素")
+        ax, ay = client_anchor
+        client_centers = [(ax + dx, ay + dy) for dx, dy in self._card_offsets_4()]
+        count = self._abyss_selection_count(img, ax, ay)
+        preferred = self._preferred_skill_slots(img, client_centers)
+        print(f"[{tag}选技能] 按钮张数={count}/2 优先顺序={preferred}")
+
+        confirm_cx, confirm_cy = ax - 8, ay + 410
+
+        if count >= 2:
+            self._click_client(confirm_cx, confirm_cy)
+            time.sleep(0.4)
+            print(f"[{tag}选技能] 已满2张，直接确定 客户区({confirm_cx},{confirm_cy})")
+            return (ax, ay)
+
+        picked = []
+        for slot in preferred:
+            if count >= 2:
+                break
+            cx, cy = client_centers[slot]
+            before = count
+            self._click_client(cx, cy, press_delay=0.12)
+            time.sleep(0.55)
+            img = self.take_screenshot(force_new=True)
+            if img is None:
+                break
+            # 锚点可能随动画微抖，张数仍按原 ay 附近按钮区域读
+            count = self._abyss_selection_count(img, ax, ay)
+            if count > before:
+                picked.append((slot, "选中", count))
+                print(f"[{tag}选技能] 卡位{slot}选中 → {count}/2")
+            elif count < before:
+                self._click_client(cx, cy, press_delay=0.12)
+                time.sleep(0.55)
+                img = self.take_screenshot(force_new=True)
+                if img is not None:
+                    count = self._abyss_selection_count(img, ax, ay)
+                picked.append((slot, "已选跳过", count))
+                print(f"[{tag}选技能] 卡位{slot}本已选中，恢复后跳过 → {count}/2")
+            else:
+                picked.append((slot, "无效果", count))
+                print(f"[{tag}选技能] 卡位{slot}点击无效果 → {count}/2")
+
+        if count >= 2:
+            time.sleep(0.2)
+            self._click_client(confirm_cx, confirm_cy)
+            time.sleep(0.4)
+            print(
+                f"[{tag}选技能] 凑满2张后确定 {picked} 客户区({confirm_cx},{confirm_cy})"
+            )
         else:
-            # 3选1：点卡片下半部文字区(y≈570)，图标区(y≈473)点不中。
-            # 探查实测成功点为客户区(96,540)，相对锚点y=195偏移≈345。
-            self.click(anchor_cx, anchor_cy + 345)
-            print("[元素选技能] 3选1：点中间卡文字区")
+            print(f"[{tag}选技能] 本轮仍不足2张({count})，下轮再试 {picked}")
+        return (ax, ay)
+
+    def find_click_skill_pick_one(self, tag="选技能", choose_threshold=0.8):
+        """3选1 统一逻辑：卡位 ROI 按技能优先级排序，点排序第一的卡（点即生效）。
+
+        优先级：GUI 优先技能 → SKILL_LIST → 左到右。全未命中时点左起第一张兜底。
+        """
+        img = self.take_screenshot(force_new=True)
+        if img is None:
+            return None
+        client_anchor = self._match_choose_skill_client(img, threshold=choose_threshold)
+        if not client_anchor:
+            return None
+        ax, ay = client_anchor
+        icon_centers = [(ax + dx, ay + dy) for dx, dy in self._card_offsets_3_icon()]
+        click_centers = [(ax + dx, ay + dy) for dx, dy in self._card_offsets_3_click()]
+        preferred = self._preferred_skill_slots(img, icon_centers)
+        slot = preferred[0]
+        cx, cy = click_centers[slot]
+        self._click_client(cx, cy, press_delay=0.12)
         time.sleep(0.3)
-        return choose
+        print(f"[{tag}] 3选1 优先顺序={preferred} → 点卡位{slot} 客户区({cx},{cy})")
+        return (ax, ay)
+
+    def find_click_skill_element(self):
+        """元素试炼选技能：前5轮4选2、第6轮起3选1；一律按技能优先级。
+        两种布局靠"选择技能"标题中心 y 区分（客户区）：
+          4选2 标题中心 y≈342；3选1 标题中心 y≈205
+        标题模板火焰动画帧会导致匹配分波动，阈值取 0.55。
+        """
+        img = self.take_screenshot(force_new=True)
+        if img is None:
+            return None
+        client_anchor = self._match_choose_skill_client(img, threshold=0.55)
+        if not client_anchor:
+            return None
+        ax, ay = client_anchor
+        if ay > 280:
+            # 4选2：与深渊同一套优先级+按钮张数逻辑（火焰标题用 0.55）
+            return self.find_click_skill_abyss(tag="元素", choose_threshold=0.55)
+        return self.find_click_skill_pick_one(tag="元素", choose_threshold=0.55)
 
     def find_click_skill(self):
+        """选技能总入口：所有模式统一按技能优先级选卡。"""
         self.find_click_think_tank()
-        # 深渊模式走专用逻辑（4选2），其他模式保持原样（3选1）
         if self.mode == 4:
-            return self.find_click_skill_abyss()
-        # 元素试炼：前5轮4选2、第6轮起3选1，用专用固定卡位逻辑
+            return self.find_click_skill_abyss(tag="深渊")
         if self.mode == 5:
             return self.find_click_skill_element()
-        """判断能否点击技能按钮"""
-        choose_skill = self.find_template("choose-skill.png")
-        if not choose_skill:
-            choose_skill = self.find_template("choose-skill-1.png")
-            if not choose_skill:
-                return None
-
-        matched = False
-
-        # 首先检查4个优先技能
-        for priority_skill_templates in self.priority_skills:
-            if priority_skill_templates:
-                # priority_skill_templates 是模板文件名列表
-                for template in priority_skill_templates:
-                    # 确保文件名包含.png扩展名
-                    if not template.endswith(".png"):
-                        template = f"{template}.png"
-                    skill_pos = self.find_template(template)
-                    if skill_pos:
-                        self.click(*skill_pos)
-                        matched = True
-                        # time.sleep(0.1)
-                        # return None
-
-        # 如果优先技能未匹配到，从全部技能中按顺序匹配
-        for skill in SKILL_LIST:
-            for template in skill["template"]:
-                # 确保文件名包含.png扩展名
-                if not template.endswith(".png"):
-                    template = f"{template}.png"
-                skill_pos = self.find_template(template)
-                if skill_pos:
-                    self.click(*skill_pos)
-                    matched = True
-                    # time.sleep(0.1)
-                    # return None
-
-        # 兜底：模板全未命中时按固定卡位点中间一张（主线/环球均为 3 选 1，点卡即生效）。
-        # 扫技能时截图可能已切走，先同帧复核仍在选技能页再点，避免战斗中误点。
-        if not matched:
-            self.take_screenshot(force_new=True)
-            still_choose = self.find_template("choose-skill.png") or self.find_template(
-                "choose-skill-1.png"
-            )
-            if not still_choose:
-                return None
-            anchor_cx, anchor_cy = still_choose
-            self.click(anchor_cx, anchor_cy + 278)
-            print(f"[选技能兜底] 模板未命中，固定点中间卡 ({anchor_cx},{anchor_cy + 278})")
-            time.sleep(0.2)
-            return still_choose
-
-        return None
+        # 主线/环球：3选1，卡位 ROI + 优先级（不再全屏盲匹配、不再固定点中间）
+        return self.find_click_skill_pick_one(tag="选技能", choose_threshold=0.8)
 
     def find_battling(self):
         """判断是否在战斗中"""
