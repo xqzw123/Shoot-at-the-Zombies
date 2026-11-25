@@ -1255,12 +1255,10 @@ class GameBot:
     def find_click_skill_pick_one(self, tag="选技能", choose_threshold=0.8):
         """3选1 统一逻辑：卡位 ROI 按技能优先级排序，点排序第一的卡（点即生效）。
 
-        优先级：GUI 优先技能 → SKILL_LIST → 左到右。全未命中时点左起第一张兜底。
+        兜底顺序：优先技能 → 未识别卡 → 已识别的非优先技能。
         """
-        # 技能卡出场有动画(缩放/淡入)。抓到过渡帧时模板匹配会全部落空 -> 全"未识别"
-        # -> fallback 点卡0，表现为"优先级失效"(偶发、与具体技能无关)。
-        # 处理：全部卡未识别时不急着点，等一帧再抓，最多重试3次；仍失败才兜底。
-        max_retry = 3
+        n_prio = len([p for p in self.priority_skills if p])
+        max_retry = 4
         for attempt in range(max_retry):
             img = self.take_screenshot(force_new=True)
             if img is None:
@@ -1269,28 +1267,52 @@ class GameBot:
             if not client_anchor:
                 return None
             ax, ay = client_anchor
+            # 开局「选技能倒计时」过渡界面：标题中心 ay≈270，卡片位是灰色1/2/3占位符，
+            # 底部提示"倒计时结束后将随机选择词条"。此时卡片尚未渲染，点任何位置都无效。
+            # 真正的3选1选技能界面标题 ay≈206（4选2是342/459）。
+            if 245 <= ay <= 300:
+                if self.match_log_enabled:
+                    print(f"[{tag}] 选技能倒计时过渡页(标题y={ay})，等卡片翻开，不点击")
+                time.sleep(0.6)
+                return None
             icon_centers = [(ax + dx, ay + dy) for dx, dy in self._card_offsets_3_icon()]
             click_centers = [(ax + dx, ay + dy) for dx, dy in self._card_offsets_3_click()]
             # 3选1 图标≈原模板尺寸(实测空间裂隙1.0匹配0.99)，必须用1.0缩放
             preferred, detail = self._preferred_skill_slots(
                 img, icon_centers, scale=self.SKILL_TPL_SCALE_PICK_ONE, return_detail=True
             )
-            recognized = [d for d in detail if d[1] < 999]  # rank<999 才算识别到
-            if recognized:
+            prio_hits = [d for d in detail if 0 <= d[1] < n_prio]
+            unknown = [d for d in detail if d[1] >= 999]
+            if prio_hits or not unknown:
+                # 识别到优先技能，或三张全识别(确实没有优先技能可选) -> 可以点
                 break
-            # 全未识别：首帧存图便于事后诊断；等待动画结束后重试
+            # 没有优先技能且仍有卡未识别：多等几帧。旧逻辑"有1张识别到就break"
+            # 会在只识别出时空裂隙(rank19)时就点它，而用户配置里根本没有时空裂隙。
             if attempt == 0:
                 self._save_skill_debug(img, tag, ax, ay)
             if attempt < max_retry - 1:
-                print(f"[{tag}] 卡片疑似出场动画中(全未识别)，等待重试 {attempt+1}/{max_retry-1}")
-                time.sleep(0.4)  # 单步调试下也等待，保证抓到稳定帧
+                print(f"[{tag}] 未识别到优先技能且仍有{len(unknown)}张未识别，等待重试 {attempt+1}/{max_retry-1}")
+                time.sleep(0.5)
 
-        slot = preferred[0]
+        # 兜底排序：优先技能 > 未识别卡 > 已识别的非优先技能。
+        # 未识别的可能是优先技能只是没匹配上(动画/模板差异)，比确定的低优先级卡更值得点。
+        rank_by_slot = {d[0]: d[1] for d in detail}
+
+        def _order(slot):
+            r = rank_by_slot.get(slot, 999)
+            if 0 <= r < n_prio:
+                return (0, r, slot)      # 优先技能最前
+            if r >= 999:
+                return (1, 0, slot)      # 未识别卡次之
+            return (2, r, slot)          # 已识别的非优先技能最后
+
+        slot = min(preferred, key=_order)
         cx, cy = click_centers[slot]
         self._click_client(cx, cy, press_delay=0.12)
         time.sleep(0.3)
         recognized_n = len([d for d in detail if d[1] < 999])
-        print(f"[{tag}] 3选1 识别{recognized_n}张 优先顺序={preferred} → 点卡位{slot} 客户区({cx},{cy})")
+        chosen = next((d[3] for d in detail if d[0] == slot), "?")
+        print(f"[{tag}] 3选1 识别{recognized_n}张 优先顺序={preferred} → 点卡位{slot}({chosen}) 客户区({cx},{cy})")
         return (ax, ay)
 
     def _save_skill_debug(self, img, tag, ax, ay):
