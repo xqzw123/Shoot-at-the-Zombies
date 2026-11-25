@@ -14,7 +14,6 @@ import sys
 import argparse
 import atexit
 import json
-from pynput import keyboard, mouse
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext
 import threading
@@ -59,12 +58,15 @@ class GameBot:
         self.debug_mode = debug_mode
         self.step_event = threading.Event()
         self.step_count = 0
-        self.hotkey_listener = None
-        self.mouse_listener = None
+        # 热键用 GetAsyncKeyState 轮询，不用 pynput 全局钩子（会打断微信输入法组字）
+        self._hotkey_thread = None
+        self._hotkey_esc_down = False
+        self._hotkey_f8_down = False
+        self._mouse_left_down = False
         # 记录用户最近一次点击的位置和时间（用于判断是否在主动操作游戏）
         self._last_click_pos = None
         self._last_click_time = 0
-        # 临时查看窗口的截止时间（F1触发后几秒内不隐藏）
+        # 临时查看窗口的截止时间（F8触发后几秒内不隐藏）
         self._peek_until = 0
         """初始化游戏机器人"""
         self.game_title = game_title
@@ -353,8 +355,13 @@ class GameBot:
             h = win32gui.GetWindow(h, win32con.GW_HWNDNEXT)
         return False
 
-    def _push_game_down(self, hwnd, restore_focus):
-        """把游戏窗口压回窗口堆叠底部"""
+    def _push_game_down(self, hwnd, restore_focus=False):
+        """把游戏窗口压回窗口堆叠底部。
+
+        默认不再 SetForegroundWindow 抢回微信等窗口：找队伍时游戏频繁闪前台，
+        若强行把焦点塞回聊天框，会打断输入法/清空正在打的字。
+        只把游戏沉底即可，焦点留给系统自然处理。
+        """
         # 只在用户最近3秒内真实点击过游戏窗口时才不压制（用户在主动操作游戏）。
         # 鼠标只是悬停不算——游戏窗口占屏幕很大，悬停很常见，不能因此跳过压制。
         try:
@@ -369,7 +376,7 @@ class GameBot:
         try:
             win32gui.SetWindowPos(hwnd, win32con.HWND_NOTOPMOST, 0, 0, 0, 0, flags)
             win32gui.SetWindowPos(hwnd, win32con.HWND_BOTTOM, 0, 0, 0, 0, flags)
-            if restore_focus:
+            if restore_focus and self._last_foreground:
                 self._restore_foreground(self._last_foreground)
             # 日志节流：同一消息最多2秒打一次，避免刷屏
             now = time.time()
@@ -380,20 +387,17 @@ class GameBot:
             pass
 
     def _keep_game_background(self):
-        """兜底监测：万一游戏窗口仍抢到前台或被单独置顶，立刻压回"""
+        """兜底监测：万一游戏窗口仍抢到前台或被单独置顶，立刻压回（不抢焦点）"""
         hwnd = self._get_hwnd()
         if not hwnd:
             return
         fg = win32gui.GetForegroundWindow()
         if fg == hwnd:
-            # 抢到前台：压回底部并归还焦点
-            self._push_game_down(hwnd, restore_focus=True)
+            self._push_game_down(hwnd, restore_focus=False)
         else:
             if fg:
-                # 记录用户当前正在使用的窗口，供抢前台时归还焦点
                 self._last_foreground = fg
             if self._is_above_foreground(hwnd, fg):
-                # 仅置顶未激活：压回底部即可，焦点没丢
                 self._push_game_down(hwnd, restore_focus=False)
 
     def _ensure_hidden(self):
@@ -492,12 +496,13 @@ class GameBot:
                     self._ensure_noactivate()
                     self._keep_game_background()
                 else:
-                    # 快速焦点监测(0.05秒一次)：游戏抢到前台立即压回并归还焦点
+                    # 快速焦点监测(0.05秒一次)：游戏抢到前台只沉底，不 SetForeground 抢回微信
+                    # （抢回聊天焦点会清空/打断正在输入的文字，找队伍时尤其频繁）
                     hwnd = self._get_hwnd()
                     if hwnd:
                         fg = win32gui.GetForegroundWindow()
                         if fg == hwnd:
-                            self._push_game_down(hwnd, restore_focus=True)
+                            self._push_game_down(hwnd, restore_focus=False)
                         elif fg:
                             self._last_foreground = fg
             except Exception:
@@ -809,11 +814,11 @@ class GameBot:
         win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
         win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
 
-    def click_fast_batch(self, positions):
-        """批量快速点击多个位置，逐个点击确保每个都完成"""
+    def click_fast_batch(self, positions, interval=0.05):
+        """批量后台点击多个位置（仅 PostMessage，不移动真实鼠标）"""
         for x, y in positions:
             self.click_fast(x, y)
-            time.sleep(0.05)
+            time.sleep(interval)
 
     def swipe_up(self, distance=200, duration=0.3):
         """在游戏窗口中间位置按住鼠标向上滑动，页面上划指定像素"""
@@ -917,9 +922,9 @@ class GameBot:
                             pos = (pos[0] + 150, pos[1])
                             positions.append(pos)
                         if positions:
-                            # 倒序点击
+                            # 倒序连点，间隔保持短，优先抢队速度
                             positions.reverse()
-                            self.click_fast_batch(positions)
+                            self.click_fast_batch(positions, interval=0.05)
                     else:
                         leave_button = self.find_leave_button()
                         if leave_button:
@@ -1752,61 +1757,76 @@ class GameBot:
                 self.find_click_expedition_ready()
                 self.find_click_sure()
 
-    def on_hotkey(self, key):
-        """快捷键回调函数"""
+    def _handle_esc(self):
+        print("检测到ESC键，正在停止脚本...")
+        self.running = False
+        self.step_event.set()
+
+    def _handle_f8(self):
+        # F8: 临时显示游戏窗口8秒（供查看情况），之后自动藏回屏幕外
+        print("F8: 临时显示游戏窗口8秒，之后自动藏回")
+        self._peek_until = time.time() + 8
+        hwnd = self._get_hwnd()
+        if not hwnd:
+            return
         try:
-            if key == keyboard.Key.esc:
-                print("检测到ESC键，正在停止脚本...")
-                self.running = False
-                # 单步阻塞时唤醒主循环线程，避免按ESC后线程仍卡在等待
-                self.step_event.set()
-                if self.hotkey_listener:
-                    self.hotkey_listener.stop()
-                if self.mouse_listener:
-                    self.mouse_listener.stop()
-                return False
-            if key == keyboard.Key.f8:
-                # F8: 临时显示游戏窗口8秒（供查看情况），8秒后自动藏回屏幕外
-                print("F8: 临时显示游戏窗口8秒，之后自动藏回")
-                self._peek_until = time.time() + 8
-                hwnd = self._get_hwnd()
-                if hwnd:
-                    if win32gui.IsIconic(hwnd):
-                        win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-                    # 直接移到屏幕内固定可见位置(右上角附近)，不依赖可能失效的隐藏前位置
-                    vx = win32api.GetSystemMetrics(76)
-                    vy = win32api.GetSystemMetrics(77)
-                    vw = win32api.GetSystemMetrics(78)
-                    cur = win32gui.GetWindowRect(hwnd)
-                    w = cur[2] - cur[0]
-                    h = cur[3] - cur[1]
-                    new_x = vx + vw - w - 30
-                    new_y = vy + 30
-                    if new_x < vx:
-                        new_x = vx
-                    win32gui.MoveWindow(hwnd, new_x, new_y, w, h, True)
-        except AttributeError:
-            pass
-        return True
+            if win32gui.IsIconic(hwnd):
+                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            vx = win32api.GetSystemMetrics(76)
+            vy = win32api.GetSystemMetrics(77)
+            vw = win32api.GetSystemMetrics(78)
+            cur = win32gui.GetWindowRect(hwnd)
+            w = cur[2] - cur[0]
+            h = cur[3] - cur[1]
+            new_x = vx + vw - w - 30
+            new_y = vy + 30
+            if new_x < vx:
+                new_x = vx
+            win32gui.MoveWindow(hwnd, new_x, new_y, w, h, True)
+        except Exception as e:
+            print(f"F8显示窗口失败: {e}")
+
+    def _poll_hotkeys(self):
+        """GetAsyncKeyState 边沿检测热键/鼠标，不安装全局钩子。"""
+        esc = bool(win32api.GetAsyncKeyState(win32con.VK_ESCAPE) & 0x8000)
+        f8 = bool(win32api.GetAsyncKeyState(win32con.VK_F8) & 0x8000)
+        if esc and not self._hotkey_esc_down:
+            self._handle_esc()
+        if f8 and not self._hotkey_f8_down:
+            self._handle_f8()
+        self._hotkey_esc_down = esc
+        self._hotkey_f8_down = f8
+
+        left = bool(win32api.GetAsyncKeyState(win32con.VK_LBUTTON) & 0x8000)
+        if left and not self._mouse_left_down:
+            try:
+                self._last_click_pos = win32gui.GetCursorPos()
+                self._last_click_time = time.time()
+            except Exception:
+                pass
+        self._mouse_left_down = left
+
+    def _hotkey_poll_loop(self):
+        """热键轮询线程：替代 pynput，避免微信聊天输入被清空。"""
+        while self.running:
+            try:
+                self._poll_hotkeys()
+            except Exception:
+                pass
+            time.sleep(0.05)
 
     def setup_hotkey(self):
-        """设置快捷键监听"""
-        print("已设置快捷键: ESC键 - 停止脚本, F8键 - 临时显示游戏窗口5秒")
-        self.hotkey_listener = keyboard.Listener(on_release=self.on_hotkey)
-        self.hotkey_listener.start()
-
-        # 鼠标监听：记录用户真实点击位置，用于判断是否在主动操作游戏
-        # （避免"鼠标只是悬停在游戏窗口上"就错误地不压制）
-        def on_click(x, y, button, pressed):
-            if pressed:
-                self._last_click_pos = (x, y)
-                self._last_click_time = time.time()
-        self.mouse_listener = mouse.Listener(on_click=on_click)
-        self.mouse_listener.start()
+        """启动热键轮询（非钩子）"""
+        print("已设置快捷键: ESC键 - 停止脚本, F8键 - 临时显示游戏窗口8秒")
+        print("提示: 热键改为系统轮询，不再使用全局键盘钩子（减轻对微信输入的干扰）")
+        self._hotkey_esc_down = False
+        self._hotkey_f8_down = False
+        self._mouse_left_down = False
+        self._hotkey_thread = threading.Thread(target=self._hotkey_poll_loop, daemon=True)
+        self._hotkey_thread.start()
 
     def main_loop(self):
         """主循环"""
-        # 设置快捷键监听
         self.setup_hotkey()
 
         # 后台模式：启动压制线程（窗口移出屏幕外隐藏+防激活+焦点监测）
@@ -2788,7 +2808,7 @@ if __name__ == "__main__":
     root.mainloop()
 
 # 使用说明:
-# 1. 安装必要的依赖: pip install pyautogui opencv-python pillow pynput pywin32
+# 1. 安装必要的依赖: pip install pyautogui opencv-python pillow pywin32
 # 2. 替换脚本中的游戏窗口标题为你的游戏窗口标题
 # 3. 在 templates 文件夹中添加游戏界面元素的截图作为模板
 # 4. 运行脚本: python game_bot.py
