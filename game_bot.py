@@ -10,6 +10,7 @@ from win32 import win32gui
 import time
 import random
 import os
+import re
 import sys
 import argparse
 import atexit
@@ -1258,7 +1259,11 @@ class GameBot:
         兜底顺序：优先技能 → 未识别卡 → 已识别的非优先技能。
         """
         n_prio = len([p for p in self.priority_skills if p])
-        max_retry = 4
+        # 环球模式是「转盘抽技能」：标题 ay≈270 恒定，卡片先以灰色1/2/3占位符出现，
+        # 转盘停止后才翻牌成技能卡（翻牌后图标落在标题+278的位置，与元素试炼同一套点位）。
+        # 所以不能因 y=270 就退出——必须在同一轮内持续重抓，等翻牌后再判定点击。
+        # 倒计时约10秒，最多等 8×0.6s≈5s，仍无卡才兜底。
+        max_retry = 8
         for attempt in range(max_retry):
             img = self.take_screenshot(force_new=True)
             if img is None:
@@ -1267,14 +1272,6 @@ class GameBot:
             if not client_anchor:
                 return None
             ax, ay = client_anchor
-            # 开局「选技能倒计时」过渡界面：标题中心 ay≈270，卡片位是灰色1/2/3占位符，
-            # 底部提示"倒计时结束后将随机选择词条"。此时卡片尚未渲染，点任何位置都无效。
-            # 真正的3选1选技能界面标题 ay≈206（4选2是342/459）。
-            if 245 <= ay <= 300:
-                if self.match_log_enabled:
-                    print(f"[{tag}] 选技能倒计时过渡页(标题y={ay})，等卡片翻开，不点击")
-                time.sleep(0.6)
-                return None
             icon_centers = [(ax + dx, ay + dy) for dx, dy in self._card_offsets_3_icon()]
             click_centers = [(ax + dx, ay + dy) for dx, dy in self._card_offsets_3_click()]
             # 3选1 图标≈原模板尺寸(实测空间裂隙1.0匹配0.99)，必须用1.0缩放
@@ -1286,13 +1283,15 @@ class GameBot:
             if prio_hits or not unknown:
                 # 识别到优先技能，或三张全识别(确实没有优先技能可选) -> 可以点
                 break
-            # 没有优先技能且仍有卡未识别：多等几帧。旧逻辑"有1张识别到就break"
-            # 会在只识别出时空裂隙(rank19)时就点它，而用户配置里根本没有时空裂隙。
+            # 未翻牌(占位符)或未识别到优先技能：持续重抓等待转盘翻牌。
+            # 旧逻辑"有1张识别到就break"会在只识别出时空裂隙(rank19)时就点它，
+            # 而用户配置里根本没有时空裂隙。
             if attempt == 0:
                 self._save_skill_debug(img, tag, ax, ay)
             if attempt < max_retry - 1:
-                print(f"[{tag}] 未识别到优先技能且仍有{len(unknown)}张未识别，等待重试 {attempt+1}/{max_retry-1}")
-                time.sleep(0.5)
+                if self.match_log_enabled:
+                    print(f"[{tag}] 等卡片翻牌/优先技能，已识别{3-len(unknown)}张，重试 {attempt+1}/{max_retry-1}")
+                time.sleep(0.6)
 
         # 兜底排序：优先技能 > 未识别卡 > 已识别的非优先技能。
         # 未识别的可能是优先技能只是没匹配上(动画/模板差异)，比确定的低优先级卡更值得点。
@@ -1316,13 +1315,20 @@ class GameBot:
         return (ax, ay)
 
     def _save_skill_debug(self, img, tag, ax, ay):
-        """选技能全未识别时保存截图，便于事后诊断动画帧/布局问题。"""
+        """选技能全未识别时保存截图，便于事后诊断动画帧/布局问题。
+
+        文件名带模式号和 tag（如 m0_环球_选技能），避免不同模式截图混在一起无法区分。
+        """
         try:
             os.makedirs(self.screenshot_dir, exist_ok=True)
-            name = f"skill_unrecognized_{int(time.time())}.png"
+            mode_name = {0: "环球", 1: "主线", 2: "普通远征", 3: "超级远征", 4: "深渊", 5: "元素"}.get(
+                getattr(self, "mode", -1), f"m{getattr(self, 'mode', -1)}"
+            )
+            safe_tag = re.sub(r"[^\w\u4e00-\u9fff-]", "", str(tag))
+            name = f"skill_m{getattr(self, 'mode', -1)}_{mode_name}_{safe_tag}_{int(time.time())}.png"
             path = os.path.join(self.screenshot_dir, name)
             cv2.imwrite(path, img)
-            print(f"[{tag}] 全未识别，截图已保存: {path} (锚点客户区 y={ay - self.game_window[1] if self.game_window else ay})")
+            print(f"[{tag}] 全未识别，截图已保存: {path} (锚点客户区 y={ay})")
         except Exception as e:
             print(f"[{tag}] 保存诊断截图失败: {e}")
 
