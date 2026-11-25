@@ -1094,7 +1094,7 @@ class GameBot:
                 best = score
         return best if best >= threshold else 0.0
 
-    def _preferred_skill_slots(self, img, client_centers, scale=None):
+    def _preferred_skill_slots(self, img, client_centers, scale=None, return_detail=False):
         """全模式共用：按 优先技能 → SKILL_LIST → 左到右 给卡位排序。
 
         修复"出现时空裂隙后优先级失效"：
@@ -1111,7 +1111,7 @@ class GameBot:
             groups.append(skill["template"])
             group_names.append(skill["name"])
 
-        slot_rank = []
+        slot_rank, detail = [], []
         for slot, (cx, cy) in enumerate(client_centers):
             rank, score, best_name = 999, 0.0, "未识别"
             for prio_idx, templates in enumerate(groups):
@@ -1120,10 +1120,14 @@ class GameBot:
                 if s > score:
                     rank, score, best_name = prio_idx, s, group_names[prio_idx]
             slot_rank.append((rank, -score, slot))
+            detail.append((slot, rank, score, best_name))
             if self.match_log_enabled:
                 print(f"[选技能] 卡{slot} 识别={best_name}({score:.2f}) rank={rank}")
         slot_rank.sort()
-        return [slot for _, __, slot in slot_rank]
+        ordered = [slot for _, __, slot in slot_rank]
+        if return_detail:
+            return ordered, detail
+        return ordered
 
     @staticmethod
     def _skill_name_of(templates):
@@ -1253,25 +1257,52 @@ class GameBot:
 
         优先级：GUI 优先技能 → SKILL_LIST → 左到右。全未命中时点左起第一张兜底。
         """
-        img = self.take_screenshot(force_new=True)
-        if img is None:
-            return None
-        client_anchor = self._match_choose_skill_client(img, threshold=choose_threshold)
-        if not client_anchor:
-            return None
-        ax, ay = client_anchor
-        icon_centers = [(ax + dx, ay + dy) for dx, dy in self._card_offsets_3_icon()]
-        click_centers = [(ax + dx, ay + dy) for dx, dy in self._card_offsets_3_click()]
-        # 3选1 图标≈原模板尺寸(实测空间裂隙1.0匹配0.99)，必须用1.0缩放
-        preferred = self._preferred_skill_slots(
-            img, icon_centers, scale=self.SKILL_TPL_SCALE_PICK_ONE
-        )
+        # 技能卡出场有动画(缩放/淡入)。抓到过渡帧时模板匹配会全部落空 -> 全"未识别"
+        # -> fallback 点卡0，表现为"优先级失效"(偶发、与具体技能无关)。
+        # 处理：全部卡未识别时不急着点，等一帧再抓，最多重试3次；仍失败才兜底。
+        max_retry = 3
+        for attempt in range(max_retry):
+            img = self.take_screenshot(force_new=True)
+            if img is None:
+                return None
+            client_anchor = self._match_choose_skill_client(img, threshold=choose_threshold)
+            if not client_anchor:
+                return None
+            ax, ay = client_anchor
+            icon_centers = [(ax + dx, ay + dy) for dx, dy in self._card_offsets_3_icon()]
+            click_centers = [(ax + dx, ay + dy) for dx, dy in self._card_offsets_3_click()]
+            # 3选1 图标≈原模板尺寸(实测空间裂隙1.0匹配0.99)，必须用1.0缩放
+            preferred, detail = self._preferred_skill_slots(
+                img, icon_centers, scale=self.SKILL_TPL_SCALE_PICK_ONE, return_detail=True
+            )
+            recognized = [d for d in detail if d[1] < 999]  # rank<999 才算识别到
+            if recognized:
+                break
+            # 全未识别：首帧存图便于事后诊断；等待动画结束后重试
+            if attempt == 0:
+                self._save_skill_debug(img, tag, ax, ay)
+            if attempt < max_retry - 1:
+                print(f"[{tag}] 卡片疑似出场动画中(全未识别)，等待重试 {attempt+1}/{max_retry-1}")
+                time.sleep(0.4)  # 单步调试下也等待，保证抓到稳定帧
+
         slot = preferred[0]
         cx, cy = click_centers[slot]
         self._click_client(cx, cy, press_delay=0.12)
         time.sleep(0.3)
-        print(f"[{tag}] 3选1 优先顺序={preferred} → 点卡位{slot} 客户区({cx},{cy})")
+        recognized_n = len([d for d in detail if d[1] < 999])
+        print(f"[{tag}] 3选1 识别{recognized_n}张 优先顺序={preferred} → 点卡位{slot} 客户区({cx},{cy})")
         return (ax, ay)
+
+    def _save_skill_debug(self, img, tag, ax, ay):
+        """选技能全未识别时保存截图，便于事后诊断动画帧/布局问题。"""
+        try:
+            os.makedirs(self.screenshot_dir, exist_ok=True)
+            name = f"skill_unrecognized_{int(time.time())}.png"
+            path = os.path.join(self.screenshot_dir, name)
+            cv2.imwrite(path, img)
+            print(f"[{tag}] 全未识别，截图已保存: {path} (锚点客户区 y={ay - self.game_window[1] if self.game_window else ay})")
+        except Exception as e:
+            print(f"[{tag}] 保存诊断截图失败: {e}")
 
     def find_click_skill_element(self):
         """元素试炼选技能：前5轮4选2、第6轮起3选1；一律按技能优先级。
