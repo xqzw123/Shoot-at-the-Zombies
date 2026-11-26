@@ -10,6 +10,7 @@ from win32 import win32gui
 import time
 import random
 import os
+import re
 import sys
 import argparse
 import atexit
@@ -19,10 +20,14 @@ from tkinter import ttk, messagebox, scrolledtext
 import threading
 
 SKILL_LIST = [
-    {"name": "枪械", "template": ["skill.png", "skill-1.png"]},
+    # 同一技能的不同图标版本放同一组（含衍生词条）：
+    # 枪械=连发+/子弹爆炸+/急冻子弹+/生化学弹，空投轰炸=连续轰炸(+)/轰炸震荡/精准打击，
+    # 时空裂隙=裂隙扩张+/多重坍塌/坍塌增幅，迷雾之触=迅捷化，生化矩阵=矩阵裂变，
+    # 多维弹球=弹球连发。衍生卡与主技能共用图标，图像匹配无法区分，按同一优先级处理。
+    {"name": "枪械", "template": ["skill.png", "skill-1.png", "skill-qx-2.png"]},
     {"name": "温压弹", "template": ["skill-wyd.png", "skill-wyd-1.png"]},
     {"name": "干冰弹", "template": ["skill-gbd.png", "skill-gbd-1.png"]},
-    {"name": "冰雹发生器", "template": ["skill-bb.png", "skill-bb-1.png"]},
+    {"name": "冰暴发生器", "template": ["skill-bb.png", "skill-bb-1.png"]},
     {"name": "装甲车", "template": ["skill-c.png", "skill-c-1.png"]},
     {"name": "电磁穿刺", "template": ["skill-d.png", "skill-d-1.png"]},
     {"name": "压缩气刃", "template": ["skill-fr.png", "skill-fr-1.png"]},
@@ -32,8 +37,14 @@ SKILL_LIST = [
     {"name": "高能射线", "template": ["skill-sx.png", "skill-sx-1.png"]},
     {"name": "无人机冲击", "template": ["skill-wrj.png", "skill-wrj-1.png"]},
     {"name": "跃迁电子", "template": ["skill-yq.png", "skill-yq-1.png"]},
-    {"name": "空投轰炸", "template": ["skill-kt.png", "skill-kt-1.png"]},
-    {"name": "空间裂隙", "template": ["skill-kjlx.png", "skill-kjlx-1.png"]},
+    {"name": "空投轰炸", "template": ["skill-kt.png", "skill-kt-1.png", "skill-kt-2.png",
+                                 "skill-kt-gold-1.png", "skill-kt-gold-2.png"]},
+    {"name": "时空裂隙", "template": ["skill-kjlx.png", "skill-kjlx-1.png"]},
+    {"name": "电极柱", "template": ["skill-djz.png"]},
+    {"name": "生化矩阵", "template": ["skill-swjz.png"]},
+    {"name": "迷雾之触", "template": ["skill-mwzc.png"]},
+    {"name": "冰筑龙体", "template": ["skill-bzlt.png"]},
+    {"name": "多维弹球", "template": ["skill-dwdq.png"]},
 ]
 
 
@@ -1063,8 +1074,19 @@ class GameBot:
         return [(-195, 151), (-65, 151), (65, 151), (195, 151)]
 
     def _card_offsets_3_icon(self):
-        """3选1：图标中心相对锚点（用于 ROI 匹配优先级）。"""
+        """3选1：图标中心相对锚点（元素试炼布局，供 band_roi=False 使用）。"""
         return [(-150, 278), (0, 278), (150, 278)]
+
+    def _card_offsets_3_band_icon(self):
+        """环球/主线 3选1 转盘：带状 ROI 中心，兼容翻牌前/后两套布局。
+
+        实测(锚点 ay=270)：翻牌前小卡图标 y≈546(+276)，翻牌后大卡上移到 y≈480(+210)。
+        旧版固定 +278 只覆盖前者，翻牌后三张全部识别失败；且 ROI 宽仅 130px，
+        小于 1.0 缩放的大模板(128~142px)被整体跳过，只剩小图标乱匹配。
+        这里把中心放在两档中间 +243，配 half_h=115 覆盖 y≈398~628；
+        x 用 ±165（实测三张图标中心 98/278/461，ax≈280），配 half_w=95 完整罩住大卡。
+        """
+        return [(-165, 243), (0, 243), (165, 243)]
 
     def _card_offsets_3_click(self):
         """3选1：点击点相对锚点（文字区更易点中，元素实测 +345）。"""
@@ -1114,20 +1136,30 @@ class GameBot:
             return 0
         return best_n
 
-    # 技能模板取自更大的卡面特写(图标直径≈85px)，而选技能界面的卡图标≈60px。
-    # 实测模板缩放 0.70~0.75 时匹配分 0.93~0.98，1.0 原尺寸则全部<0.01(根本匹配不到)。
-    SKILL_TPL_SCALE = 0.72
+    # 3选1 卡图标大(≈原图尺寸)，4选2 卡图标小(≈原图0.72倍)，缩放按场景传参。
+    # 实测：3选1 用1.0时时空裂隙0.99/温压弹0.83；用0.72则全部0.47漏匹配。
+    #       4选2 用0.72时0.93~0.98；用1.0则模板大于图标全不匹配。
+    SKILL_TPL_SCALE = 0.72          # 4选2（保留兼容旧调用）
+    SKILL_TPL_SCALE_PICK_ONE = 1.0  # 3选1
+    PICK_ONE_FLIP_WAIT = 1.0        # 3选1 等三张翻牌的总时长上限(秒，含抓帧耗时)
+    PICK_ONE_FLIP_INTERVAL = 0.2    # 未凑齐 3 张时的抓帧间隔(秒)
+    PICK_ONE_FRAME_BUDGET = 0.15    # 单帧截图+识别耗时预算(实测≈0.11s)，用于卡住总时长
 
-    def _match_templates_in_roi(self, img, cx, cy, templates, threshold=0.65):
+    def _match_templates_in_roi(self, img, cx, cy, templates, threshold=0.65,
+                                scale=None, half_w=65, half_h=80, min_tpl_side=0):
         """仅在卡位 ROI 内匹配技能模板，避免全屏误匹配战斗背景。
 
-        关键：模板需按 SKILL_TPL_SCALE 缩放后才能匹配当前界面的卡图标，
-        否则原尺寸(136x128)大于ROI且图标尺度不符，全部漏匹配 -> 优先级失效、
-        退化成从左到右固定点。缩放后的模板缓存复用，避免每卡重复 resize。
+        scale: 模板缩放比。3选1传1.0(图标≈原尺寸)、4选2传0.72(图标更小)；
+               不传则用 SKILL_TPL_SCALE。缓存 key 带 scale，两种尺寸互不污染。
+        half_w/half_h: ROI 半宽/半高，默认 ±65/±80 是 4选2 原值，不要随意改。
+        min_tpl_side: 跳过(缩放后)短边小于该值的模板。3选1 传 60 可滤掉
+               25~35px 的战斗 HUD 小图标——它们会在大 ROI 里随机拿到 0.99 分。
         """
+        if scale is None:
+            scale = self.SKILL_TPL_SCALE
         h_img, w_img = img.shape[:2]
-        x1, y1 = max(0, cx - 65), max(0, cy - 80)
-        x2, y2 = min(w_img, cx + 65), min(h_img, cy + 80)
+        x1, y1 = max(0, cx - half_w), max(0, cy - half_h)
+        x2, y2 = min(w_img, cx + half_w), min(h_img, cy + half_h)
         roi = img[y1:y2, x1:x2]
         if roi.size == 0:
             return 0.0
@@ -1137,7 +1169,7 @@ class GameBot:
                 continue
             if not name.endswith(".png"):
                 name = f"{name}.png"
-            cache_key = f"scaled:{name}"
+            cache_key = f"scaled:{scale}:{name}"
             if cache_key in self.template_cache:
                 tmpl = self.template_cache[cache_key]
             else:
@@ -1145,12 +1177,14 @@ class GameBot:
                 if raw is None:
                     continue
                 tmpl = cv2.resize(
-                    raw, None, fx=self.SKILL_TPL_SCALE, fy=self.SKILL_TPL_SCALE,
+                    raw, None, fx=scale, fy=scale,
                     interpolation=cv2.INTER_AREA,
                 )
                 self.template_cache[cache_key] = tmpl
             th, tw = tmpl.shape[:2]
             rh, rw = roi.shape[:2]
+            if min(th, tw) < min_tpl_side:
+                continue
             if th > rh or tw > rw:
                 continue
             res = cv2.matchTemplate(roi, tmpl, cv2.TM_CCOEFF_NORMED)
@@ -1159,28 +1193,58 @@ class GameBot:
                 best = score
         return best if best >= threshold else 0.0
 
-    def _preferred_skill_slots(self, img, client_centers):
-        """全模式共用：按 优先技能 → SKILL_LIST → 左到右 给卡位排序。"""
-        groups = []
+    def _preferred_skill_slots(self, img, client_centers, scale=None,
+                               return_detail=False, roi_half=None, min_tpl_side=60):
+        """全模式共用：按 优先技能 → SKILL_LIST → 左到右 给卡位排序。
+
+        修复"出现时空裂隙后优先级失效"：
+        1) 取"匹配分最高的技能组"而非首个过阈值，避免误匹配插队。
+        2) 3选1 图标比4选2大，必须传 scale=1.0；否则全用0.72会全"未识别"
+           → 退化成从左到右点第一张(3选1优先级失效的真正根因)。
+        3) 默认值按 4选2 实测调整：ROI ±95/115、滤掉 25~35px 的 -1 小模板。
+           实测 4 张 4选2 截图(16 张卡)全部识别；金色「连续轰炸+」卡在原
+           ±65/80 下只能靠 skill-kt-1.png 小模板拿 0.81，加宽后由
+           skill-kt-gold-1.png 拿 0.96，不再依赖小模板误匹配。
+           3选1 仍显式传 scale=1.0 / roi_half=(95,115) / min_tpl_side=60。
+        """
+        groups, group_names = [], []
         for templates in self.priority_skills:
             if templates:
                 groups.append(templates)
+                group_names.append(self._skill_name_of(templates))
         for skill in SKILL_LIST:
             groups.append(skill["template"])
+            group_names.append(skill["name"])
 
-        slot_rank = []
+        slot_rank, detail = [], []
+        half_w, half_h = roi_half if roi_half else (95, 115)
         for slot, (cx, cy) in enumerate(client_centers):
-            rank = 999
-            score = 0.0
+            rank, score, best_name = 999, 0.0, "未识别"
             for prio_idx, templates in enumerate(groups):
-                s = self._match_templates_in_roi(img, cx, cy, templates)
-                if s > 0:
-                    rank = prio_idx
-                    score = s
-                    break
+                s = self._match_templates_in_roi(
+                    img, cx, cy, templates, scale=scale,
+                    half_w=half_w, half_h=half_h, min_tpl_side=min_tpl_side,
+                )
+                # 取最高分，而非首个命中：避免误匹配到靠前的优先技能就插队
+                if s > score:
+                    rank, score, best_name = prio_idx, s, group_names[prio_idx]
             slot_rank.append((rank, -score, slot))
+            detail.append((slot, rank, score, best_name))
+            if self.match_log_enabled:
+                print(f"[选技能] 卡{slot} 识别={best_name}({score:.2f}) rank={rank}")
         slot_rank.sort()
-        return [slot for _, __, slot in slot_rank]
+        ordered = [slot for _, __, slot in slot_rank]
+        if return_detail:
+            return ordered, detail
+        return ordered
+
+    @staticmethod
+    def _skill_name_of(templates):
+        """模板列表 -> 技能中文名（仅用于诊断日志）。"""
+        for skill in SKILL_LIST:
+            if skill["template"] == templates:
+                return skill["name"]
+        return str(templates[0]) if templates else "?"
 
     def _match_choose_skill_client(self, img, threshold=0.8):
         """在截图（客户区坐标系）上找「选择技能」锚点中心，返回 (cx,cy) 或 None。"""
@@ -1297,27 +1361,88 @@ class GameBot:
             print(f"[{tag}选技能] 本轮仍不足2张({count})，下轮再试 {picked}")
         return (ax, ay)
 
-    def find_click_skill_pick_one(self, tag="选技能", choose_threshold=0.8):
+    def find_click_skill_pick_one(self, tag="选技能", choose_threshold=0.8,
+                                  band_roi=True):
         """3选1 统一逻辑：卡位 ROI 按技能优先级排序，点排序第一的卡（点即生效）。
 
-        优先级：GUI 优先技能 → SKILL_LIST → 左到右。全未命中时点左起第一张兜底。
+        band_roi=True(环球/主线)：用带状 ROI 罩住转盘翻牌前/后两套布局，只匹配大模板；
+        band_roi=False(元素试炼)：沿用旧的 ±150/+278 点位与默认 ROI，行为不变。
+
+        翻牌判断：等三张卡都识别出来再比优先级，总等待封顶 PICK_ONE_FLIP_WAIT(1s)。
+        实测单帧识别≈0.11s，1s 内可抓 5~7 帧；超时就按当前帧已识别的卡取 rank 最优，
+        不再像旧版那样固定等 12×0.5=6s 却因 ROI/模板问题一张都认不出。
         """
-        img = self.take_screenshot(force_new=True)
-        if img is None:
-            return None
-        client_anchor = self._match_choose_skill_client(img, threshold=choose_threshold)
-        if not client_anchor:
-            return None
-        ax, ay = client_anchor
-        icon_centers = [(ax + dx, ay + dy) for dx, dy in self._card_offsets_3_icon()]
-        click_centers = [(ax + dx, ay + dy) for dx, dy in self._card_offsets_3_click()]
-        preferred = self._preferred_skill_slots(img, icon_centers)
+        max_wait = self.PICK_ONE_FLIP_WAIT
+        flip_sleep = self.PICK_ONE_FLIP_INTERVAL
+        max_frames = 6  # 帧数保险；正常 1s 内约 5~7 帧，由时间上限兜底
+        offsets = self._card_offsets_3_band_icon() if band_roi else self._card_offsets_3_icon()
+        roi_half = (95, 115) if band_roi else None
+        min_tpl_side = 60 if band_roi else 0
+        t0 = time.monotonic()
+        deadline = t0 + max_wait
+        for attempt in range(max_frames):
+            # 预算不够再抓一帧时直接用上一帧的识别结果，避免总时长越过 max_wait
+            if attempt and time.monotonic() + self.PICK_ONE_FRAME_BUDGET > deadline:
+                break
+            img = self.take_screenshot(force_new=True)
+            if img is None:
+                return None
+            client_anchor = self._match_choose_skill_client(img, threshold=choose_threshold)
+            if not client_anchor:
+                return None
+            ax, ay = client_anchor
+            icon_centers = [(ax + dx, ay + dy) for dx, dy in offsets]
+            click_centers = [(ax + dx, ay + dy) for dx, dy in self._card_offsets_3_click()]
+            # 3选1 卡面是大图标：必须 scale=1.0，并滤掉 25~35px 的 HUD 小图标。
+            preferred, detail = self._preferred_skill_slots(
+                img, icon_centers, scale=self.SKILL_TPL_SCALE_PICK_ONE,
+                return_detail=True, roi_half=roi_half, min_tpl_side=min_tpl_side,
+            )
+            any_hit = [d for d in detail if d[1] < 999]
+            hit_count = len(any_hit)
+            elapsed = time.monotonic() - t0
+            # 三张都翻开了 → 可以完整比较优先级
+            if hit_count >= 3:
+                break
+            if elapsed >= max_wait:
+                break
+            if self.match_log_enabled:
+                print(f"[{tag}] 第{attempt+1}帧已翻牌{hit_count}/3张，等其余翻牌 ({elapsed:.2f}s/{max_wait:.1f}s)")
+            time.sleep(min(flip_sleep, max(0.0, deadline - time.monotonic())))
+
+        elapsed = time.monotonic() - t0
+        if not any_hit:
+            # 三张全未识别才算异常，存一张供事后定位。"没有优先技能"是正常局面，不存图。
+            self._save_skill_debug(img, tag, ax, ay, suffix="unrecognized")
+
+        # preferred 已按 rank 升序（优先技能 → SKILL_LIST → 未识别），取第一张即可。
+        # 旧的 _order 把"未识别卡"排到已识别卡之前，会把明明识别到的技能挤掉。
         slot = preferred[0]
         cx, cy = click_centers[slot]
         self._click_client(cx, cy, press_delay=0.12)
         time.sleep(0.3)
-        print(f"[{tag}] 3选1 优先顺序={preferred} → 点卡位{slot} 客户区({cx},{cy})")
+        chosen = next((d[3] for d in detail if d[0] == slot), "?")
+        print(f"[{tag}] 3选1 翻牌{len(any_hit)}/3 等待{elapsed:.2f}s 优先顺序={preferred} → 点卡位{slot}({chosen}) 客户区({cx},{cy})")
         return (ax, ay)
+
+    def _save_skill_debug(self, img, tag, ax, ay, suffix=""):
+        """选技能识别异常时保存截图，便于事后诊断加载时序/布局问题。
+
+        文件名带模式号、tag、帧标记（如 m0_环球_选技能_first），不同模式/阶段一眼可区分。
+        """
+        try:
+            os.makedirs(self.screenshot_dir, exist_ok=True)
+            mode_name = {0: "环球", 1: "主线", 2: "普通远征", 3: "超级远征", 4: "深渊", 5: "元素"}.get(
+                getattr(self, "mode", -1), f"m{getattr(self, 'mode', -1)}"
+            )
+            safe_tag = re.sub(r"[^\w\u4e00-\u9fff-]", "", str(tag))
+            safe_suffix = f"_{re.sub(r'[^\w-]', '', str(suffix))}" if suffix else ""
+            name = f"skill_m{getattr(self, 'mode', -1)}_{mode_name}_{safe_tag}_{int(time.time())}{safe_suffix}.png"
+            path = os.path.join(self.screenshot_dir, name)
+            cv2.imwrite(path, img)
+            print(f"[{tag}] 诊断截图已保存: {path} (锚点客户区 y={ay})")
+        except Exception as e:
+            print(f"[{tag}] 保存诊断截图失败: {e}")
 
     def find_click_skill_element(self):
         """元素试炼选技能：前5轮4选2、第6轮起3选1；一律按技能优先级。
@@ -1335,7 +1460,7 @@ class GameBot:
         if ay > 280:
             # 4选2：与深渊同一套优先级+按钮张数逻辑（火焰标题用 0.55）
             return self.find_click_skill_abyss(tag="元素", choose_threshold=0.55)
-        return self.find_click_skill_pick_one(tag="元素", choose_threshold=0.55)
+        return self.find_click_skill_pick_one(tag="元素", choose_threshold=0.55, band_roi=False)
 
     def find_click_skill(self):
         """选技能总入口：所有模式统一按技能优先级选卡。"""
