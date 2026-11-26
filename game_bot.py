@@ -21,9 +21,7 @@ import threading
 
 SKILL_LIST = [
     # 同一技能的不同图标版本放同一组（含衍生词条）：
-    # 枪械=连发+/子弹爆炸+/急冻子弹+/生化学弹，空投轰炸=连续轰炸(+)/轰炸震荡/精准打击，
-    # 时空裂隙=裂隙扩张+/多重坍塌/坍塌增幅，迷雾之触=迅捷化，生化矩阵=矩阵裂变，
-    # 多维弹球=弹球连发。衍生卡与主技能共用图标，图像匹配无法区分，按同一优先级处理。
+    # 衍生卡与主技能共用图标，大类靠模板，具体词条靠 OCR 卡名。
     {"name": "枪械", "template": ["skill.png", "skill-1.png", "skill-qx-2.png"]},
     {"name": "温压弹", "template": ["skill-wyd.png", "skill-wyd-1.png"]},
     {"name": "干冰弹", "template": ["skill-gbd.png", "skill-gbd-1.png"]},
@@ -47,6 +45,155 @@ SKILL_LIST = [
     {"name": "多维弹球", "template": ["skill-dwdq.png"]},
 ]
 
+# 各大类完整衍生词条（用户梳理）。下拉展示会折叠 xx/xx+、I型/II型 为公共词干。
+SKILL_DERIVATIVES = {
+    "枪械": [
+        "伤害增幅", "连发", "齐射", "极速射击", "子弹爆炸", "火焰子弹", "电磁子弹",
+        "急冻子弹", "分裂子弹", "分裂子弹四射", "分裂子弹爆炸", "子弹穿透", "子弹弹射",
+        "连发+", "齐射+", "全子弹增幅", "分裂子弹增伤", "爆炸增伤", "爆炸扩散",
+        "子弹磁暴", "分裂冰片", "子弹穿透+", "穿透弹射+", "生化子弹", "打击指令",
+    ],
+    "温压弹": [
+        "温压冲击", "爆炸火花", "热能爆炸", "热能燃爆", "热能焚身", "温压弹连发",
+        "超爆弹", "富燃料填充", "温压弹连发+", "热能爆发", "热能燃烧",
+    ],
+    "干冰弹": [
+        "干冰弹增伤", "急冻寒冰", "低温贯穿", "散射小冰弹", "急冻小冰弹", "干冰弹连发",
+        "干冰弹齐射", "极寒大冰弹", "冰冻侵袭", "小冰蛋增伤", "重冰穿透", "凝霜重冰",
+    ],
+    "电磁穿刺": [
+        "麻痹增伤", "电磁爆炸", "电磁追捕", "电磁分流", "电磁裂变", "电磁增伤",
+        "核能电磁", "电磁矩阵", "高压电矩阵", "稳定电矩阵", "电系缩减", "高压粒子",
+        "电磁爆炸增伤", "电磁爆炸扩张", "电磁爆冰",
+    ],
+    "装甲车": [
+        "急速冲锋", "致命冲撞", "致残碾压", "势不可挡", "增伤装置", "军备强化",
+        "重型坦克", "连续出击", "连续出击+", "焦土策略", "钢铁洪流",
+    ],
+    "高能射线": [
+        "充能", "破坏射线", "致残射线", "射线增伤", "射线扩散", "高能过载",
+        "闪击射线", "高能光波", "扫荡射线", "能量强化",
+    ],
+    "制导激光": [
+        "功率增幅", "聚焦", "聚焦弱点", "追踪折射", "焦点引爆", "制导电磁",
+        "激光增伤", "电能激荡",
+    ],
+    "冰暴发生器": [
+        "冰暴增伤", "连环冰暴", "冰暴延续", "冰暴地带", "冰暴之眼", "冰霜爆炸",
+        "冰暴加农", "冰系缩减", "冰雹扩张", "碎裂小冰蛋", "小冰蛋贯穿",
+    ],
+    "跃迁电子": [
+        "复合电子", "增伤电子", "多重跃导", "高压电子", "电离爆炸", "自发电子",
+        "永动电子", "电离扩张", "高压电离", "电系增幅",
+    ],
+    "旋风加农": [
+        "风力加强", "气旋扩张", "延长气流", "强袭旋风", "双重旋风", "风暴聚焦",
+        "闪电加农", "漩涡增压",
+    ],
+    "空投轰炸": [
+        "精准打击", "轰炸增伤", "轰炸扩张", "轰炸震荡", "连续轰炸", "连续轰炸+",
+        "狂轰乱炸", "热核轰炸", "热核侵蚀", "热核延续",
+    ],
+    "压缩气刃": [
+        "气刃连斩", "气刃风波", "低温风波", "旋风气刃", "利刃", "气刃多连斩",
+        "多重气刃", "多重气刃+", "气刃穿透", "气刃狂潮", "乱流刃", "膨胀气刃",
+        "气刃重击",
+    ],
+    "燃油弹": [
+        "火焰侵袭", "硫化火焰", "死亡爆炸", "火势扩散", "快速装填", "多重油蛋",
+        "燃料改良", "燃油凝滞",
+    ],
+    "无人机冲击": [
+        "无人机冲击", "长效蓄能", "旋转利刃", "猛烈震荡", "高速飞行", "重装机型",
+        "悬浮滞空", "烈焰无人机", "无人机气刃",
+    ],
+    "电极柱": [
+        "额外电极", "额外电极+", "超负载", "增伤电极", "电极麻痹", "高压吸附",
+        "易损电极", "高压电离", "延长连线", "宽度增加", "充能电极",
+    ],
+    "多维弹球": [
+        "弹球浪潮", "超武装", "低维·增伤", "低维·弹射", "低维·连发", "升维",
+        "升维+", "急速弹射", "弹射裂变", "弹球重击", "弹球连发", "动能裂变",
+        "高维·弹射", "高维·连发", "弹珠雨", "致残撞击", "武装弹球", "终极破坏",
+        "终极循环", "毁灭猛击",
+    ],
+    "时空裂隙": [
+        "时空聚变", "相对稳定", "急剧膨胀", "裂隙扩张", "裂隙扩张+", "次元裂隙",
+        "多重裂隙", "失重力场", "时间激流", "时空跳跃", "量子观测", "坍缩增幅",
+        "多重坍缩",
+    ],
+    "生化矩阵": [
+        "通路污染", "潜热爆发", "矩阵扩散", "同频共振", "矩阵裂变", "矩阵脉冲",
+        "同源重组", "中心力场", "重构过载", "相变迷宫", "矩阵毒素", "熵增回响",
+    ],
+    "冰筑龙体": [
+        "冰息强灼", "寒雾扩散", "融化", "快速攻击", "冰链束缚", "冰痕延滞",
+        "冰锥震荡", "超导", "机核蜕变I型", "机核蜕变II型", "能量回流", "相对零度",
+        "回馈充能", "汲能", "多重冲击", "连锁",
+    ],
+    "迷雾之触": [
+        "蔓延", "重击", "巨大化", "碾压", "迅捷化", "延伸", "缠绕", "污染",
+    ],
+}
+
+# 各大类默认偏好衍生（最多 3；用折叠后的展示名，OCR 子串可同时覆盖 xx / xx+）
+# 来源：docs/衍生技能默认偏好勾选.md 用户勾选
+SKILL_DEFAULT_DERIVATIVES = {
+    "枪械": ["连发", "齐射", "分裂子弹"],
+    "温压弹": ["热能焚身", "温压弹连发", "超爆弹"],
+    "干冰弹": ["干冰弹连发", "干冰弹齐射", "极寒大冰弹"],
+    "电磁穿刺": ["电磁分流", "电磁裂变", "电磁矩阵"],
+    "装甲车": ["急速冲锋", "连续出击", "焦土策略"],
+    "高能射线": ["破坏射线", "射线扩散", "高能光波"],
+    "制导激光": ["功率增幅", "聚焦", "聚焦弱点"],
+    "冰暴发生器": ["连环冰暴", "冰暴延续", "冰雹扩张"],
+    "跃迁电子": ["复合电子", "多重跃导", "永动电子"],
+    "旋风加农": ["气旋扩张", "延长气流", "双重旋风"],
+    "空投轰炸": ["精准打击", "轰炸扩张", "连续轰炸"],
+    "压缩气刃": ["气刃多连斩", "多重气刃", "乱流刃"],
+    "燃油弹": ["火势扩散", "快速装填", "多重油蛋"],
+    "无人机冲击": ["长效蓄能", "猛烈震荡", "重装机型"],
+    "电极柱": ["额外电极", "延长连线", "宽度增加"],
+    "多维弹球": ["弹射裂变", "动能裂变", "高维·连发"],
+    "时空裂隙": ["急剧膨胀", "裂隙扩张", "多重裂隙"],
+    "生化矩阵": ["矩阵脉冲", "矩阵毒素", "熵增回响"],
+    "冰筑龙体": ["融化", "机核蜕变", "能量回流"],
+    "迷雾之触": ["蔓延", "迅捷化", "缠绕"],
+}
+
+
+def collapse_derivative_labels(names):
+    """下拉展示折叠：连发/连发+ → 连发；机核蜕变I型/II型 → 机核蜕变。"""
+    uniq = list(dict.fromkeys(n for n in names if n))
+    has = set(uniq)
+    no_plus = []
+    for n in uniq:
+        if n.endswith("+") and n[:-1] in has:
+            continue
+        no_plus.append(n)
+    stem_hits = {}
+    for n in no_plus:
+        m = re.match(r"^(.+?)([IVX]+)型$", n)
+        if m:
+            stem_hits[m.group(1)] = stem_hits.get(m.group(1), 0) + 1
+    out, seen_stem = [], set()
+    for n in no_plus:
+        m = re.match(r"^(.+?)([IVX]+)型$", n)
+        if m and stem_hits.get(m.group(1), 0) > 1:
+            stem = m.group(1)
+            if stem in seen_stem:
+                continue
+            seen_stem.add(stem)
+            out.append(stem)
+        else:
+            out.append(n)
+    return out
+
+
+def derivative_choices_for(skill_name):
+    """某大类可供选择的衍生展示名（已折叠）。"""
+    return collapse_derivative_labels(SKILL_DERIVATIVES.get(skill_name, []))
+
 
 class GameBot:
     def __init__(
@@ -63,6 +210,9 @@ class GameBot:
         match_log_enabled=False,
         debug_mode=False,
         recruit_click_interval=0.05,
+        priority_derivatives=None,
+        exclude_element_ammo=False,
+        skill_capture_enabled=False,
     ):
         self.running = True
         # 单步调试模式：主循环每轮开头阻塞在 step_event，由 GUI 点"下一步"放行一轮。
@@ -91,6 +241,12 @@ class GameBot:
         self.game_window = None
         self.screenshot_dir = "screenshots"
         self.priority_skills = priority_skills if priority_skills else []
+        # {技能名: [偏好衍生1, 偏好衍生2, 偏好衍生3]}，空串忽略；图标认大类，OCR 认衍生名
+        self.priority_derivatives = priority_derivatives if priority_derivatives else {}
+        self.exclude_element_ammo = bool(exclude_element_ammo)
+        self.skill_capture_enabled = bool(skill_capture_enabled)
+        self._ocr_engine = None
+        self._ocr_load_failed = False
         self.rich_mode = rich_mode
         self.quick_exit = quick_exit
         self.on_battle_count_changed = None
@@ -230,12 +386,15 @@ class GameBot:
         win32gui.PostMessage(hwnd, msg, wparam, lparam)
 
     def _post_click(self, x, y, press_delay=0.05):
-        """后台点击：发送鼠标按下/抬起消息，不移动真实鼠标"""
+        """后台点击：发送鼠标按下/抬起消息，不移动真实鼠标。
+        点完若游戏窗被激活，立刻把焦点还给点击前的窗口。"""
+        self._remember_user_foreground()
         self._post_mouse(x, y, win32con.WM_MOUSEMOVE, 0)
         time.sleep(0.02)
         self._post_mouse(x, y, win32con.WM_LBUTTONDOWN, win32con.MK_LBUTTON)
         time.sleep(press_delay)
         self._post_mouse(x, y, win32con.WM_LBUTTONUP, 0)
+        self._reclaim_foreground_if_game()
 
     def _post_drag(self, x1, y1, x2, y2, duration=0.3):
         """后台拖动：分步发送鼠标消息模拟滑动（减速收尾，松开后不触发惯性滚动）"""
@@ -298,10 +457,51 @@ class GameBot:
             win32gui.PostMessage(hwnd, win32con.WM_KEYUP, vk, lparam_up)
             print(f"后台按下按键: {key}")
 
+    def _is_wechat_hwnd(self, hwnd):
+        """微信主窗/聊天窗。把焦点塞回去会打断输入框，初版是 SetForeground 失败后才不影响微信。"""
+        if not hwnd:
+            return False
+        try:
+            cls = win32gui.GetClassName(hwnd) or ""
+            if "WeChat" in cls or "Weixin" in cls or cls.startswith("mmui::"):
+                return True
+            title = win32gui.GetWindowText(hwnd) or ""
+            if title in ("微信", "WeChat", "Weixin"):
+                return True
+            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            handle = ctypes.windll.kernel32.OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+            )
+            if not handle:
+                return False
+            try:
+                buf = ctypes.create_unicode_buffer(520)
+                size = ctypes.c_ulong(len(buf))
+                ok = ctypes.windll.kernel32.QueryFullProcessImageNameW(
+                    handle, 0, buf, ctypes.byref(size)
+                )
+                if ok:
+                    exe = os.path.basename(buf.value).lower()
+                    return exe in ("wechat.exe", "weixin.exe")
+            finally:
+                ctypes.windll.kernel32.CloseHandle(handle)
+        except Exception:
+            return False
+        return False
+
     def _restore_foreground(self, target_hwnd):
         """把前台还给指定窗口（AttachThreadInput绕过前台锁定限制）
-        注意：pywin32 312 的 win32api 没有 AttachThreadInput，必须走 ctypes.user32"""
+        注意：pywin32 312 的 win32api 没有 AttachThreadInput，必须走 ctypes.user32
+        微信聊天窗不还焦点：成功 SetForeground 会让输入框光标乱跳、打不了字。
+        """
         if not target_hwnd or not win32gui.IsWindow(target_hwnd) or win32gui.IsIconic(target_hwnd):
+            return
+        if self._is_wechat_hwnd(target_hwnd):
+            now = time.time()
+            if now - getattr(self, "_last_wechat_fg_log", 0) >= 5:
+                self._last_wechat_fg_log = now
+                print("微信窗口只压回游戏，不归还焦点")
             return
         try:
             cur_thread = win32api.GetCurrentThreadId()
@@ -316,8 +516,8 @@ class GameBot:
             for tid in threads:
                 ctypes.windll.user32.AttachThreadInput(cur_thread, tid, True)
             try:
+                # 只还前台，不再 BringWindowToTop：置顶会把游戏和聊天窗口来回抖
                 win32gui.SetForegroundWindow(target_hwnd)
-                win32gui.BringWindowToTop(target_hwnd)
             finally:
                 for tid in threads:
                     ctypes.windll.user32.AttachThreadInput(cur_thread, tid, False)
@@ -328,40 +528,97 @@ class GameBot:
                 self._last_fg_log = now
                 print(f"归还焦点失败: {e}")
 
+    def _is_game_foreground(self, fg=None):
+        """当前前台是否是游戏顶层窗（含它的子窗口被激活后的根窗）。"""
+        game = self._get_hwnd()
+        if fg is None:
+            try:
+                fg = win32gui.GetForegroundWindow()
+            except Exception:
+                return False
+        if not fg or not game:
+            return False
+        if fg == game:
+            return True
+        try:
+            return win32gui.GetAncestor(fg, 2) == game  # GA_ROOT
+        except Exception:
+            return False
+
+    def _remember_user_foreground(self):
+        """记下用户正在用的窗口，供游戏抢前台后还回去。"""
+        try:
+            fg = win32gui.GetForegroundWindow()
+        except Exception:
+            return
+        if fg and not self._is_game_foreground(fg):
+            self._last_foreground = fg
+
+    def _reclaim_foreground_if_game(self):
+        """游戏窗若成了前台，立刻还给点击前的窗口，避免其它软件输入框失焦。"""
+        if not self._is_game_foreground():
+            return
+        target = self._last_foreground
+        if target and win32gui.IsWindow(target):
+            self._restore_foreground(target)
+
+    def _apply_noactivate(self, hwnd, keep_taskbar=False):
+        if not hwnd or not win32gui.IsWindow(hwnd):
+            return
+        styled = getattr(self, "_noactivate_styled", None)
+        if styled is None:
+            self._noactivate_styled = {}
+            styled = self._noactivate_styled
+        if hwnd in styled:
+            return
+        exstyle = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
+        new_style = exstyle | win32con.WS_EX_NOACTIVATE
+        if keep_taskbar:
+            new_style |= win32con.WS_EX_APPWINDOW
+        win32gui.SetWindowLong(hwnd, win32con.GWL_EXSTYLE, new_style)
+        win32gui.SetWindowPos(
+            hwnd, 0, 0, 0, 0, 0,
+            win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | win32con.SWP_NOZORDER
+            | win32con.SWP_NOACTIVATE | win32con.SWP_FRAMECHANGED,
+        )
+        styled[hwnd] = exstyle
+
     def _ensure_noactivate(self):
-        """给游戏窗口加WS_EX_NOACTIVATE样式，从根源上禁止它激活自己置顶
-        （微信调用SetForegroundWindow会直接失败，不会闪现窗口；游戏窗口关闭重开后自动重新应用）"""
+        """顶层窗和 Chrome 渲染子窗都加 WS_EX_NOACTIVATE。
+        只加顶层时，点在 Chrome_RenderWidgetHostHWND 上仍会把小程序激活到前台。"""
         hwnd = self._get_hwnd()
-        if not hwnd or hwnd == self._noactivate_hwnd:
+        if not hwnd:
             return
         try:
-            exstyle = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
-            # WS_EX_APPWINDOW保证加了防激活样式后任务栏图标仍然显示
-            win32gui.SetWindowLong(
-                hwnd,
-                win32con.GWL_EXSTYLE,
-                exstyle | win32con.WS_EX_NOACTIVATE | win32con.WS_EX_APPWINDOW,
-            )
-            self._noactivate_hwnd = hwnd
-            self._orig_exstyle = exstyle
-            print("已为游戏窗口启用防激活(WS_EX_NOACTIVATE)，它将无法再抢前台")
+            before = len(getattr(self, "_noactivate_styled", {}) or {})
+            self._apply_noactivate(hwnd, keep_taskbar=True)
+            click = self._get_click_hwnd()
+            if click and click != hwnd:
+                self._apply_noactivate(click, keep_taskbar=False)
+            if len(self._noactivate_styled) > before:
+                print("已为游戏窗口启用防激活(WS_EX_NOACTIVATE)，它将无法再抢前台")
         except Exception as e:
             print(f"设置防激活样式失败: {e}")
 
     def _remove_noactivate(self):
         """脚本停止时恢复游戏窗口原始样式，方便用户手动操作游戏"""
-        hwnd = self._noactivate_hwnd
-        if not hwnd:
-            return
-        try:
-            if win32gui.IsWindow(hwnd):
-                win32gui.SetWindowLong(hwnd, win32con.GWL_EXSTYLE, self._orig_exstyle)
+        styled = getattr(self, "_noactivate_styled", None) or {}
+        # 兼容旧字段
+        if not styled and self._noactivate_hwnd and self._orig_exstyle is not None:
+            styled = {self._noactivate_hwnd: self._orig_exstyle}
+        restored = False
+        for hwnd, exstyle in list(styled.items()):
+            try:
+                if win32gui.IsWindow(hwnd):
+                    win32gui.SetWindowLong(hwnd, win32con.GWL_EXSTYLE, exstyle)
+                    restored = True
+            except Exception:
+                pass
+        if restored:
             print("已恢复游戏窗口原始样式")
-        except Exception:
-            pass
-        finally:
-            self._noactivate_hwnd = None
-            self._orig_exstyle = None
+        self._noactivate_styled = {}
+        self._noactivate_hwnd = None
+        self._orig_exstyle = None
 
     def _is_above_foreground(self, hwnd, fg):
         """判断游戏窗口是否叠在当前前台窗口之上（未激活但被单独置顶的情况）"""
@@ -376,12 +633,10 @@ class GameBot:
             h = win32gui.GetWindow(h, win32con.GW_HWNDNEXT)
         return False
 
-    def _push_game_down(self, hwnd, restore_focus=False):
-        """把游戏窗口压回窗口堆叠底部。
+    def _push_game_down(self, hwnd, restore_focus=True):
+        """把游戏窗口压回窗口堆叠底部，并把前台还给用户正在用的窗口。
 
-        默认不再 SetForegroundWindow 抢回微信等窗口：找队伍时游戏频繁闪前台，
-        若强行把焦点塞回聊天框，会打断输入法/清空正在打的字。
-        只把游戏沉底即可，焦点留给系统自然处理。
+        只沉底不还焦点时，键盘焦点会留在屏幕外的游戏窗上，其它软件输入框全部失焦。
         """
         # 只在用户最近3秒内真实点击过游戏窗口时才不压制（用户在主动操作游戏）。
         # 鼠标只是悬停不算——游戏窗口占屏幕很大，悬停很常见，不能因此跳过压制。
@@ -408,13 +663,13 @@ class GameBot:
             pass
 
     def _keep_game_background(self):
-        """兜底监测：万一游戏窗口仍抢到前台或被单独置顶，立刻压回（不抢焦点）"""
+        """兜底监测：游戏抢到前台或被单独置顶时压回，并把焦点还给用户窗口"""
         hwnd = self._get_hwnd()
         if not hwnd:
             return
         fg = win32gui.GetForegroundWindow()
-        if fg == hwnd:
-            self._push_game_down(hwnd, restore_focus=False)
+        if self._is_game_foreground(fg):
+            self._push_game_down(hwnd, restore_focus=True)
         else:
             if fg:
                 self._last_foreground = fg
@@ -432,12 +687,14 @@ class GameBot:
             # 用户请求临时查看窗口（按快捷键后几秒内不隐藏）
             if getattr(self, "_peek_until", 0) and time.time() < self._peek_until:
                 if win32gui.IsIconic(hwnd):
-                    win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+                    win32gui.ShowWindow(hwnd, win32con.SW_SHOWNOACTIVATE)
                 return
 
-            # 最小化窗口无法截图，先恢复（恢复后可能回屏幕内，下一轮再藏）
+            # 最小化窗口无法截图。用 SHOWNOACTIVATE，避免 SW_RESTORE 把游戏拉成前台
             if win32gui.IsIconic(hwnd):
-                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+                self._remember_user_foreground()
+                win32gui.ShowWindow(hwnd, win32con.SW_SHOWNOACTIVATE)
+                self._reclaim_foreground_if_game()
                 time.sleep(0.3)
                 return
 
@@ -469,7 +726,18 @@ class GameBot:
             target_w = 542 + max(0, border_w)
             target_h = 1010 + max(0, border_h)
 
-            win32gui.MoveWindow(hwnd, target_x, vy if (vy := win32api.GetSystemMetrics(77)) else 0, target_w, target_h, True)
+            vy = win32api.GetSystemMetrics(77)
+            self._remember_user_foreground()
+            win32gui.SetWindowPos(
+                hwnd,
+                0,
+                target_x,
+                vy or 0,
+                target_w,
+                target_h,
+                win32con.SWP_NOACTIVATE | win32con.SWP_NOZORDER,
+            )
+            self._reclaim_foreground_if_game()
             self._hidden_hwnd = hwnd
             # 日志节流：避免每次检测都打印
             now = time.time()
@@ -517,13 +785,12 @@ class GameBot:
                     self._ensure_noactivate()
                     self._keep_game_background()
                 else:
-                    # 快速焦点监测(0.05秒一次)：游戏抢到前台只沉底，不 SetForeground 抢回微信
-                    # （抢回聊天焦点会清空/打断正在输入的文字，找队伍时尤其频繁）
+                    # 快速焦点监测：游戏抢到前台就沉底，并把焦点还给用户正在输入的窗口
                     hwnd = self._get_hwnd()
                     if hwnd:
                         fg = win32gui.GetForegroundWindow()
-                        if fg == hwnd:
-                            self._push_game_down(hwnd, restore_focus=False)
+                        if self._is_game_foreground(fg):
+                            self._push_game_down(hwnd, restore_focus=True)
                         elif fg:
                             self._last_foreground = fg
             except Exception:
@@ -1193,19 +1460,96 @@ class GameBot:
                 best = score
         return best if best >= threshold else 0.0
 
-    def _preferred_skill_slots(self, img, client_centers, scale=None,
-                               return_detail=False, roi_half=None, min_tpl_side=60):
-        """全模式共用：按 优先技能 → SKILL_LIST → 左到右 给卡位排序。
+    def _need_skill_ocr(self):
+        """仅在配置了偏好衍生 / 排除元素弹药 / 采集截图时才跑 OCR。"""
+        if self.exclude_element_ammo or self.skill_capture_enabled:
+            return True
+        for names in (self.priority_derivatives or {}).values():
+            if any(n and str(n).strip() for n in (names or [])):
+                return True
+        return False
 
-        修复"出现时空裂隙后优先级失效"：
-        1) 取"匹配分最高的技能组"而非首个过阈值，避免误匹配插队。
-        2) 3选1 图标比4选2大，必须传 scale=1.0；否则全用0.72会全"未识别"
-           → 退化成从左到右点第一张(3选1优先级失效的真正根因)。
-        3) 默认值按 4选2 实测调整：ROI ±95/115、滤掉 25~35px 的 -1 小模板。
-           实测 4 张 4选2 截图(16 张卡)全部识别；金色「连续轰炸+」卡在原
-           ±65/80 下只能靠 skill-kt-1.png 小模板拿 0.81，加宽后由
-           skill-kt-gold-1.png 拿 0.96，不再依赖小模板误匹配。
-           3选1 仍显式传 scale=1.0 / roi_half=(95,115) / min_tpl_side=60。
+    def _get_ocr_engine(self):
+        if self._ocr_engine is not None:
+            return self._ocr_engine
+        if self._ocr_load_failed:
+            return None
+        try:
+            from rapidocr_onnxruntime import RapidOCR
+            self._ocr_engine = RapidOCR()
+            return self._ocr_engine
+        except Exception as e:
+            self._ocr_load_failed = True
+            print(f"[OCR] 初始化失败，衍生名识别不可用: {e}")
+            return None
+
+    @staticmethod
+    def _normalize_skill_text(s):
+        return re.sub(r"\s+", "", str(s or ""))
+
+    def _ocr_card_name(self, img, cx, cy, half_w=70, top=35, bottom=105):
+        """在图标中心下方标题带 OCR 卡名；失败返回空串。"""
+        engine = self._get_ocr_engine()
+        if engine is None or img is None:
+            return ""
+        h_img, w_img = img.shape[:2]
+        x1, y1 = max(0, int(cx - half_w)), max(0, int(cy + top))
+        x2, y2 = min(w_img, int(cx + half_w)), min(h_img, int(cy + bottom))
+        if x2 <= x1 or y2 <= y1:
+            return ""
+        roi = img[y1:y2, x1:x2]
+        if roi.size == 0:
+            return ""
+        try:
+            # RapidOCR 接受 BGR ndarray；结果 [(box, text, score), ...]
+            result, _ = engine(roi)
+            if not result:
+                return ""
+            parts = []
+            for item in result:
+                if len(item) >= 2 and item[1]:
+                    parts.append(str(item[1]).strip())
+            return self._normalize_skill_text("".join(parts))
+        except Exception as e:
+            if self.match_log_enabled:
+                print(f"[OCR] 卡名识别失败: {e}")
+            return ""
+
+    def _derivative_rank_of(self, family, card_name):
+        """该大类下偏好衍生 0..2；同族其它或 OCR 失败 → 3。"""
+        prefs = [
+            self._normalize_skill_text(n)
+            for n in (self.priority_derivatives.get(family) or [])[:3]
+            if n and str(n).strip()
+        ]
+        if not card_name or not prefs:
+            return 3
+        name = self._normalize_skill_text(card_name)
+        for i, p in enumerate(prefs):
+            if p and (p in name or name in p):
+                return i
+        return 3
+
+    def _is_excluded_skill_card(self, family, card_name):
+        if not self.exclude_element_ammo:
+            return False
+        if family != "枪械":
+            return False
+        if not card_name:
+            return False
+        return "元素弹药" in self._normalize_skill_text(card_name)
+
+    def _preferred_skill_slots(self, img, client_centers, scale=None,
+                               return_detail=False, roi_half=None, min_tpl_side=60,
+                               use_ocr=None, do_capture=False):
+        """全模式共用：按 优先技能 → 同族偏好衍生 → SKILL_LIST → 左到右 排序。
+
+        图标只认大类；OCR 认卡名后，在同一 family_rank 内用衍生偏好细分。
+        同族非偏好衍生仍保留该大类优先级（derivative_rank=3），不会掉到后面大类之后。
+        开启「排除元素弹药」时，枪械族且 OCR 含该名的卡直接剔除。
+
+        use_ocr: None=按配置自动；翻牌等待帧传 False，最终决策帧传 True。
+        do_capture: 仅最终决策时 True，避免每帧存图。
         """
         groups, group_names = [], []
         for templates in self.priority_skills:
@@ -1216,7 +1560,8 @@ class GameBot:
             groups.append(skill["template"])
             group_names.append(skill["name"])
 
-        slot_rank, detail = [], []
+        need_ocr = self._need_skill_ocr() if use_ocr is None else bool(use_ocr)
+        slot_rank, detail, excluded = [], [], []
         half_w, half_h = roi_half if roi_half else (95, 115)
         for slot, (cx, cy) in enumerate(client_centers):
             rank, score, best_name = 999, 0.0, "未识别"
@@ -1225,18 +1570,76 @@ class GameBot:
                     img, cx, cy, templates, scale=scale,
                     half_w=half_w, half_h=half_h, min_tpl_side=min_tpl_side,
                 )
-                # 取最高分，而非首个命中：避免误匹配到靠前的优先技能就插队
                 if s > score:
                     rank, score, best_name = prio_idx, s, group_names[prio_idx]
-            slot_rank.append((rank, -score, slot))
-            detail.append((slot, rank, score, best_name))
-            if self.match_log_enabled:
-                print(f"[选技能] 卡{slot} 识别={best_name}({score:.2f}) rank={rank}")
+
+            card_name = self._ocr_card_name(img, cx, cy) if need_ocr else ""
+            if self._is_excluded_skill_card(best_name, card_name):
+                excluded.append(slot)
+                display = f"{best_name}/{card_name or '?'}[排除]"
+                detail.append((slot, 9999, score, display))
+                if self.match_log_enabled or need_ocr:
+                    print(f"[选技能] 卡{slot} 排除={display}")
+                continue
+
+            deriv = self._derivative_rank_of(best_name, card_name)
+            display = best_name if not card_name else f"{best_name}/{card_name}"
+            # family → 衍生偏好 → 匹配分 → 卡位
+            slot_rank.append((rank, deriv, -score, slot))
+            detail.append((slot, rank, score, display))
+            if self.match_log_enabled or (need_ocr and card_name):
+                print(
+                    f"[选技能] 卡{slot} 识别={display}({score:.2f}) "
+                    f"rank={rank} deriv={deriv}"
+                )
+
         slot_rank.sort()
-        ordered = [slot for _, __, slot in slot_rank]
+        ordered = [slot for _, __, ___, slot in slot_rank]
+        # 全被排除时仍按原卡位顺序兜底，避免空列表
+        if not ordered:
+            ordered = list(range(len(client_centers)))
+        if do_capture and self.skill_capture_enabled and img is not None:
+            self._save_skill_pick_capture(img, client_centers, detail, excluded)
         if return_detail:
             return ordered, detail
         return ordered
+
+    def _save_skill_pick_capture(self, img, client_centers, detail, excluded=None):
+        """选技能采集：保存带卡位/大类/OCR 名标注的截图。"""
+        try:
+            os.makedirs(self.screenshot_dir, exist_ok=True)
+            vis = img.copy()
+            by_slot = {d[0]: d for d in detail}
+            for slot, (cx, cy) in enumerate(client_centers):
+                d = by_slot.get(slot)
+                label = d[3] if d else "?"
+                color = (0, 0, 255) if excluded and slot in excluded else (0, 200, 0)
+                cv2.rectangle(
+                    vis,
+                    (int(cx - 70), int(cy + 35)),
+                    (int(cx + 70), int(cy + 105)),
+                    color,
+                    2,
+                )
+                cv2.putText(
+                    vis,
+                    f"{slot}:{label}"[:28],
+                    (int(cx - 70), int(cy + 30)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45,
+                    color,
+                    1,
+                    cv2.LINE_AA,
+                )
+            path = os.path.join(
+                self.screenshot_dir, f"skill-pick-{int(time.time())}.png"
+            )
+            cv2.imwrite(path, vis)
+            print(f"[选技能] 采集截图: {path}")
+            for d in detail:
+                print(f"  卡{d[0]} → {d[3]} (family_rank={d[1]}, score={d[2]:.2f})")
+        except Exception as e:
+            print(f"[选技能] 采集截图失败: {e}")
 
     @staticmethod
     def _skill_name_of(templates):
@@ -1311,7 +1714,9 @@ class GameBot:
         ax, ay = client_anchor
         client_centers = [(ax + dx, ay + dy) for dx, dy in self._card_offsets_4()]
         count = self._abyss_selection_count(img, ax, ay)
-        preferred = self._preferred_skill_slots(img, client_centers)
+        preferred = self._preferred_skill_slots(
+            img, client_centers, use_ocr=self._need_skill_ocr(), do_capture=True
+        )
         print(f"[{tag}选技能] 按钮张数={count}/2 优先顺序={preferred}")
 
         confirm_cx, confirm_cy = ax - 8, ay + 410
@@ -1393,10 +1798,11 @@ class GameBot:
             ax, ay = client_anchor
             icon_centers = [(ax + dx, ay + dy) for dx, dy in offsets]
             click_centers = [(ax + dx, ay + dy) for dx, dy in self._card_offsets_3_click()]
-            # 3选1 卡面是大图标：必须 scale=1.0，并滤掉 25~35px 的 HUD 小图标。
+            # 翻牌等待只跑图标匹配；OCR 留到凑齐/超时后的最终决策帧，避免拖慢翻牌。
             preferred, detail = self._preferred_skill_slots(
                 img, icon_centers, scale=self.SKILL_TPL_SCALE_PICK_ONE,
                 return_detail=True, roi_half=roi_half, min_tpl_side=min_tpl_side,
+                use_ocr=False, do_capture=False,
             )
             any_hit = [d for d in detail if d[1] < 999]
             hit_count = len(any_hit)
@@ -1415,8 +1821,13 @@ class GameBot:
             # 三张全未识别才算异常，存一张供事后定位。"没有优先技能"是正常局面，不存图。
             self._save_skill_debug(img, tag, ax, ay, suffix="unrecognized")
 
-        # preferred 已按 rank 升序（优先技能 → SKILL_LIST → 未识别），取第一张即可。
-        # 旧的 _order 把"未识别卡"排到已识别卡之前，会把明明识别到的技能挤掉。
+        # 最终决策：带 OCR 的衍生排序 + 可选采集截图
+        preferred, detail = self._preferred_skill_slots(
+            img, icon_centers, scale=self.SKILL_TPL_SCALE_PICK_ONE,
+            return_detail=True, roi_half=roi_half, min_tpl_side=min_tpl_side,
+            use_ocr=self._need_skill_ocr(), do_capture=True,
+        )
+        any_hit = [d for d in detail if d[1] < 999]
         slot = preferred[0]
         cx, cy = click_centers[slot]
         self._click_client(cx, cy, press_delay=0.12)
@@ -1942,7 +2353,7 @@ class GameBot:
             if tickets and self.rich_mode == 1:
                 self.click_expedition_fast_join()
             else:
-                if self.rich_mode == 0:
+                if self.rich_mode in (0, 2):
                     vice_captain = self.find_expedition_vice_captain()
                     base_button = self.find_base()
                     if not vice_captain and not base_button:
@@ -2316,14 +2727,18 @@ class GameBot:
                         continue
                     # 检查当前页面是否在环球页面
                     self.find_click_im()
-                # 土豪消费模式
-                if self.rich_mode == 0:
+                # 土豪消费模式：0 出票邀请，2 单人自己开
+                if self.rich_mode in (0, 2):
                     in_huanqiu_team = self.find_in_huanqiu_team()
                     if not in_huanqiu_team:
                         # 打环球
                         self.find_click_base()
                         self.find_click_experience()
                         self.find_click_huanqiu_challenge()
+                    elif self.rich_mode == 2:
+                        # 单人：不邀请、不发布招募，直接开始
+                        self.find_click_start_game_button()
+                        self.find_click_start_challenge()
                     else:
                         invite_button = self.find_huanqiu_invite()
                         if invite_button:
@@ -2481,7 +2896,7 @@ class GameBotGUI:
     def __init__(self, root):
         self.root = root
         self.root.title("游戏机器人操作界面")
-        self.root.geometry("600x800")
+        self.root.geometry("760x860")
         self.root.resizable(True, True)
 
         self.bot = None
@@ -2539,15 +2954,43 @@ class GameBotGUI:
                     self.battle_time_var.set(battle_time)
                     recruit_click_interval = config.get("recruit_click_interval", 0.05)
                     self.recruit_interval_var.set(recruit_click_interval)
+                    self.exclude_ammo_var.set(config.get("exclude_element_ammo", False))
+                    self.skill_capture_var.set(config.get("skill_capture_enabled", False))
                     # 加载优先技能配置
                     priority_skills = config.get("priority_skills", [])
                     for i, skill_name in enumerate(priority_skills):
                         if i < len(self.priority_skill_vars):
                             self.priority_skill_vars[i].set(skill_name)
+                    priority_derivatives = config.get("priority_derivatives", {})
+                    for i, skill_var in enumerate(self.priority_skill_vars):
+                        skill_name = skill_var.get()
+                        self._fill_derivative_defaults(i, skill_name, force=True)
+                        names = priority_derivatives.get(skill_name, [])
+                        if any(n and str(n).strip() for n in names):
+                            choices = [""] + derivative_choices_for(skill_name)
+                            for j in range(3):
+                                val = names[j] if j < len(names) else ""
+                                val = (val or "").strip()
+                                if val and val not in choices:
+                                    choices.append(val)
+                                self.priority_deriv_combos[i][j]["values"] = choices
+                                self.priority_deriv_vars[i][j].set(val)
                     # 触发模式变化更新显示
                     self.on_mode_changed(None)
+                    self.on_skill_selected(None)
         except Exception as e:
             print(f"加载配置失败: {e}")
+
+    def _collect_priority_derivatives(self):
+        """当前 GUI → {技能名: [衍生1,衍生2,衍生3]}，空技能跳过。"""
+        out = {}
+        for i, skill_var in enumerate(self.priority_skill_vars):
+            skill_name = skill_var.get()
+            if not skill_name:
+                continue
+            names = [v.get().strip() for v in self.priority_deriv_vars[i]]
+            out[skill_name] = names
+        return out
 
     def save_config(self):
         """保存当前配置"""
@@ -2563,7 +3006,10 @@ class GameBotGUI:
                 "max_battle_count": self.max_battle_count_var.get(),
                 "battle_time": self.battle_time_var.get(),
                 "recruit_click_interval": self.recruit_interval_var.get(),
-                "priority_skills": [var.get() for var in self.priority_skill_vars]
+                "exclude_element_ammo": self.exclude_ammo_var.get(),
+                "skill_capture_enabled": self.skill_capture_var.get(),
+                "priority_skills": [var.get() for var in self.priority_skill_vars],
+                "priority_derivatives": self._collect_priority_derivatives(),
             }
             with open(self.CONFIG_FILE, "w", encoding="utf-8") as f:
                 json.dump(config, f, ensure_ascii=False, indent=2)
@@ -2605,12 +3051,15 @@ class GameBotGUI:
         self.rich_mode_frame = ttk.Frame(self.root)
         self.rich_mode_var = tk.IntVar(value=0)
         ttk.Radiobutton(
-            self.rich_mode_frame, text="我是土豪", variable=self.rich_mode_var, value=0
+            self.rich_mode_frame, text="我是土豪（出票）", variable=self.rich_mode_var, value=0
         ).pack(side=tk.LEFT, padx=5)
         ttk.Radiobutton(
-            self.rich_mode_frame, text="我是穷B", variable=self.rich_mode_var, value=1
+            self.rich_mode_frame, text="土豪单人（自己开）", variable=self.rich_mode_var, value=2
         ).pack(side=tk.LEFT, padx=5)
-        self.rich_mode_frame.grid(row=2, column=1, padx=10, pady=5, sticky=tk.W)
+        ttk.Radiobutton(
+            self.rich_mode_frame, text="我是穷B（不出票）", variable=self.rich_mode_var, value=1
+        ).pack(side=tk.LEFT, padx=5)
+        self.rich_mode_frame.grid(row=2, column=1, columnspan=2, padx=10, pady=5, sticky=tk.W)
 
         # 秒退选项（仅普通远征、超级远征、主线显示）
         self.quick_exit_label = ttk.Label(self.root, text="秒退模式:")
@@ -2651,6 +3100,22 @@ class GameBotGUI:
             variable=self.debug_mode_var,
         )
         self.debug_mode_check.grid(row=2, column=0, sticky=tk.W)
+
+        self.exclude_ammo_var = tk.BooleanVar(value=False)
+        self.exclude_ammo_check = ttk.Checkbutton(
+            run_opts,
+            text="排除枪械「元素弹药」",
+            variable=self.exclude_ammo_var,
+        )
+        self.exclude_ammo_check.grid(row=3, column=0, sticky=tk.W)
+
+        self.skill_capture_var = tk.BooleanVar(value=False)
+        self.skill_capture_check = ttk.Checkbutton(
+            run_opts,
+            text="选技能采集截图(校对OCR)",
+            variable=self.skill_capture_var,
+        )
+        self.skill_capture_check.grid(row=4, column=0, sticky=tk.W)
 
         # 默认模式是环球，所以默认显示
         self.on_mode_changed(None)
@@ -2702,17 +3167,19 @@ class GameBotGUI:
             row=6, column=2, padx=5, pady=5, sticky=tk.W
         )
 
-        # 优先技能选项（5个）
-        ttk.Label(self.root, text="优先技能(从上到下):").grid(
+        # 优先技能选项（5个）+ 每技能最多 3 个偏好衍生名
+        ttk.Label(self.root, text="优先技能/偏好衍生:").grid(
             row=7, column=0, padx=10, pady=5, sticky=tk.W
         )
 
         # 获取技能名称列表
         skill_names = [skill["name"] for skill in SKILL_LIST]
 
-        # 5个优先技能下拉框
+        # 5个优先技能下拉框；右侧 3 个偏好衍生下拉（选项来自词条表，已折叠 xx/xx+）
         self.priority_skill_vars = []
         self.priority_skill_combos = []
+        self.priority_deriv_vars = []
+        self.priority_deriv_combos = []
         for i in range(5):
             var = tk.StringVar(value="")
             self.priority_skill_vars.append(var)
@@ -2720,15 +3187,31 @@ class GameBotGUI:
                 self.root,
                 textvariable=var,
                 values=[""] + skill_names,
-                width=15,
+                width=12,
                 state="readonly",
             )
             combo.grid(row=7 + i, column=1, padx=10, pady=3, sticky=tk.W)
             combo.bind("<<ComboboxSelected>>", self.on_skill_selected)
             self.priority_skill_combos.append(combo)
-            ttk.Label(self.root, text=f"优先级{i+1}").grid(
-                row=7 + i, column=2, padx=5, pady=3, sticky=tk.W
-            )
+
+            deriv_frame = ttk.Frame(self.root)
+            deriv_frame.grid(row=7 + i, column=2, padx=5, pady=3, sticky=tk.W)
+            ttk.Label(deriv_frame, text=f"P{i+1}衍生").pack(side=tk.LEFT, padx=(0, 4))
+            row_vars, row_combos = [], []
+            for j in range(3):
+                dvar = tk.StringVar(value="")
+                dcombo = ttk.Combobox(
+                    deriv_frame,
+                    textvariable=dvar,
+                    values=[""],
+                    width=9,
+                    state="readonly",
+                )
+                dcombo.pack(side=tk.LEFT, padx=1)
+                row_vars.append(dvar)
+                row_combos.append(dcombo)
+            self.priority_deriv_vars.append(row_vars)
+            self.priority_deriv_combos.append(row_combos)
 
         # 按钮框架
         button_frame = ttk.Frame(self.root)
@@ -2799,22 +3282,44 @@ class GameBotGUI:
         )
         self.console_text.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
 
+    def _fill_derivative_defaults(self, row_index, skill_name, force=True):
+        """切换大类时填充该行 3 个偏好衍生；force=False 时仅空位才填默认。"""
+        choices = [""] + derivative_choices_for(skill_name)
+        defaults = list(SKILL_DEFAULT_DERIVATIVES.get(skill_name, []))[:3]
+        while len(defaults) < 3:
+            defaults.append("")
+        for j, dcombo in enumerate(self.priority_deriv_combos[row_index]):
+            dcombo["values"] = choices
+            cur = self.priority_deriv_vars[row_index][j].get()
+            if force or not cur:
+                want = defaults[j]
+                if want and want not in choices:
+                    # 默认名偶发未进折叠表时仍写入，便于 OCR 子串匹配
+                    dcombo["values"] = choices + [want]
+                self.priority_deriv_vars[row_index][j].set(want if skill_name else "")
+            elif cur and cur not in dcombo["values"]:
+                dcombo["values"] = list(dcombo["values"]) + [cur]
+
     def on_skill_selected(self, event):
-        """技能选择事件，防止重复选择"""
-        # 获取所有已选择的技能
+        """技能选择：互斥大类选项，并按大类刷新/填入默认偏好衍生。"""
         selected_skills = [var.get() for var in self.priority_skill_vars if var.get()]
-
-        # 获取所有技能名称
         all_skills = [skill["name"] for skill in SKILL_LIST]
-
-        # 更新每个下拉框的可选项
+        changed_row = None
+        if event is not None:
+            for i, combo in enumerate(self.priority_skill_combos):
+                if event.widget == combo:
+                    changed_row = i
+                    break
         for i, combo in enumerate(self.priority_skill_combos):
             current_value = self.priority_skill_vars[i].get()
-            # 可选项：空 + 未被其他下拉框选中的技能
             available = [""] + [
                 s for s in all_skills if s not in selected_skills or s == current_value
             ]
             combo["values"] = available
+            if changed_row is None or changed_row == i:
+                self._fill_derivative_defaults(
+                    i, current_value, force=(changed_row == i)
+                )
 
     def _update_battle_count(self, count):
         """更新战斗次数显示（线程安全）"""
@@ -2833,7 +3338,7 @@ class GameBotGUI:
         # 仅环球、普通远征、超级远征显示土豪/穷B选项
         if mode in ["环球", "普通远征", "超级远征"]:
             self.rich_mode_label.grid(row=2, column=0, padx=10, pady=5, sticky=tk.W)
-            self.rich_mode_frame.grid(row=2, column=1, padx=10, pady=5, sticky=tk.W)
+            self.rich_mode_frame.grid(row=2, column=1, columnspan=2, padx=10, pady=5, sticky=tk.W)
         else:
             self.rich_mode_label.grid_remove()
             self.rich_mode_frame.grid_remove()
@@ -2878,6 +3383,9 @@ class GameBotGUI:
                 return
 
             # 创建GameBot实例
+            priority_derivatives = self._collect_priority_derivatives()
+            exclude_ammo = self.exclude_ammo_var.get()
+            skill_capture = self.skill_capture_var.get()
             self.bot = GameBot(
                 game_title,
                 battle_time,
@@ -2891,6 +3399,9 @@ class GameBotGUI:
                 self.match_log_var.get(),
                 debug_mode,
                 self.recruit_interval_var.get(),
+                priority_derivatives,
+                exclude_ammo,
+                skill_capture,
             )
             self.bot.on_battle_count_changed = self._update_battle_count
             if self.match_log_var.get():
@@ -2899,6 +3410,14 @@ class GameBotGUI:
                 f"[抢队] 点间隔 {self.recruit_interval_var.get():.2f}s，"
                 f"按新队伍出现统计抢中率"
             )
+            if exclude_ammo:
+                print("[选技能] 已开启：排除枪械「元素弹药」")
+            if skill_capture:
+                print("[选技能] 已开启：选技能采集截图")
+            for fam, names in priority_derivatives.items():
+                prefs = [n for n in names if n]
+                if prefs:
+                    print(f"[选技能] {fam} 偏好衍生: {', '.join(prefs)}")
 
             # 更新状态
             if debug_mode:
@@ -2920,11 +3439,16 @@ class GameBotGUI:
             self.background_mode_check.config(state=tk.DISABLED)
             self.match_log_check.config(state=tk.DISABLED)
             self.debug_mode_check.config(state=tk.DISABLED)
+            self.exclude_ammo_check.config(state=tk.DISABLED)
+            self.skill_capture_check.config(state=tk.DISABLED)
             self.max_battle_count_spinbox.config(state=tk.DISABLED)
             self.battle_time_spinbox.config(state=tk.DISABLED)
             self.recruit_interval_spinbox.config(state=tk.DISABLED)
             for combo in self.priority_skill_combos:
                 combo.config(state=tk.DISABLED)
+            for row in self.priority_deriv_combos:
+                for dcombo in row:
+                    dcombo.config(state=tk.DISABLED)
             self.resize_btn.config(state=tk.DISABLED)
 
             # 创建并启动线程
@@ -2984,11 +3508,16 @@ class GameBotGUI:
         self.background_mode_check.config(state=tk.NORMAL)
         self.match_log_check.config(state=tk.NORMAL)
         self.debug_mode_check.config(state=tk.NORMAL)
+        self.exclude_ammo_check.config(state=tk.NORMAL)
+        self.skill_capture_check.config(state=tk.NORMAL)
         self.max_battle_count_spinbox.config(state=tk.NORMAL)
         self.battle_time_spinbox.config(state=tk.NORMAL)
         self.recruit_interval_spinbox.config(state=tk.NORMAL)
         for combo in self.priority_skill_combos:
             combo.config(state=tk.NORMAL)
+        for row in self.priority_deriv_combos:
+            for dcombo in row:
+                dcombo.config(state="readonly")
         self.resize_btn.config(state=tk.NORMAL)
 
     def resize_window(self):
