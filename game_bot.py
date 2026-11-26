@@ -139,7 +139,7 @@ SKILL_DERIVATIVES = {
 # 各大类默认偏好衍生（最多 3；用折叠后的展示名，OCR 子串可同时覆盖 xx / xx+）
 # 来源：docs/衍生技能默认偏好勾选.md 用户勾选
 SKILL_DEFAULT_DERIVATIVES = {
-    "枪械": ["连发", "齐射", "分裂子弹"],
+    "枪械": ["连发", "齐射", "子弹弹射"],
     "温压弹": ["热能焚身", "温压弹连发", "超爆弹"],
     "干冰弹": ["干冰弹连发", "干冰弹齐射", "极寒大冰弹"],
     "电磁穿刺": ["电磁分流", "电磁裂变", "电磁矩阵"],
@@ -1369,7 +1369,7 @@ class GameBot:
     #       4选2 用0.72时0.93~0.98；用1.0则模板大于图标全不匹配。
     SKILL_TPL_SCALE = 0.72          # 4选2（保留兼容旧调用）
     SKILL_TPL_SCALE_PICK_ONE = 1.0  # 3选1
-    PICK_ONE_FLIP_WAIT = 1.0        # 3选1 等三张翻牌的总时长上限(秒，含抓帧耗时)
+    PICK_ONE_FLIP_WAIT = 2.0        # 3选1 等三张翻牌的总时长上限(秒)；正常≈0.6s，留足翻牌动画慢的余量
     PICK_ONE_FLIP_INTERVAL = 0.2    # 未凑齐 3 张时的抓帧间隔(秒)
     PICK_ONE_FRAME_BUDGET = 0.15    # 单帧截图+识别耗时预算(实测≈0.11s)，用于卡住总时长
 
@@ -1444,6 +1444,40 @@ class GameBot:
             print(f"[OCR] 初始化失败，衍生名识别不可用: {e}")
             return None
 
+    def _ocr_card_derivative(self, img, cx, cy, half_w=70, top=-130, bottom=-100):
+        """读卡顶标题栏的衍生技能名（如「伤害增幅」「轰炸增伤」）。
+
+        3选1 卡片标题栏在图标中心上方约 103~130px；标题字小且有描边，
+        直接 OCR 原图会漏，放大 4 倍后实测可稳定识别（置信度≈0.80）。
+        失败返回空串，调用方会回退到读效果描述的老逻辑。
+        """
+        engine = self._get_ocr_engine()
+        if engine is None or img is None:
+            return ""
+        h_img, w_img = img.shape[:2]
+        x1, y1 = max(0, int(cx - half_w)), max(0, int(cy + top))
+        x2, y2 = min(w_img, int(cx + half_w)), min(h_img, int(cy + bottom))
+        if x2 <= x1 or y2 <= y1:
+            return ""
+        roi = img[y1:y2, x1:x2]
+        if roi.size == 0:
+            return ""
+        try:
+            big = cv2.resize(roi, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
+            result, _ = engine(big)
+            if not result:
+                return ""
+            parts = [
+                str(item[1]).strip()
+                for item in result
+                if len(item) >= 2 and item[1]
+            ]
+            return self._normalize_skill_text("".join(parts))
+        except Exception as e:
+            if self.match_log_enabled:
+                print(f"[OCR] 衍生名识别失败: {e}")
+            return ""
+
     @staticmethod
     def _normalize_skill_text(s):
         return re.sub(r"\s+", "", str(s or ""))
@@ -1476,6 +1510,50 @@ class GameBot:
                 print(f"[OCR] 卡名识别失败: {e}")
             return ""
 
+    @classmethod
+    def _family_from_derivative(cls, card_name):
+        """由衍生名反查大类：模板未识别时的兜底。
+
+        必须最长词条优先：按大类遍历会让「连发」先于「温压弹连发」命中，
+        把带公共词干的衍生全误判成枪械。只做「词条 in OCR文本」，
+        不用反向包含，避免短 OCR 片段命中长词条。
+        """
+        name = cls._normalize_skill_text(card_name)
+        if not name:
+            return ""
+        pairs = []
+        for family, words in SKILL_DERIVATIVES.items():
+            for word in words:
+                w = cls._normalize_skill_text(word)
+                if w:
+                    pairs.append((len(w), w, family))
+        for _, w, family in sorted(pairs, key=lambda x: -x[0]):
+            if w in name:
+                return family
+        return ""
+
+    @classmethod
+    def _rank_of_family(cls, family, group_names):
+        """大类在排序分组里的序号；未配置返回 len（排在优先技能之后）。"""
+        if family in group_names:
+            return group_names.index(family)
+        return len(group_names)
+
+    def _matched_derivative_of(self, family, card_name):
+        """返回命中的偏好衍生词（未命中空串），供日志展示。"""
+        prefs = [
+            self._normalize_skill_text(n)
+            for n in (self.priority_derivatives.get(family) or [])[:3]
+            if n and str(n).strip()
+        ]
+        if not card_name or not prefs:
+            return ""
+        name = self._normalize_skill_text(card_name)
+        for p in prefs:
+            if p and (p in name or name in p):
+                return p
+        return ""
+
     def _derivative_rank_of(self, family, card_name):
         """该大类下偏好衍生 0..2；同族其它或 OCR 失败 → 3。"""
         prefs = [
@@ -1483,26 +1561,34 @@ class GameBot:
             for n in (self.priority_derivatives.get(family) or [])[:3]
             if n and str(n).strip()
         ]
-        if not card_name or not prefs:
-            return 3
-        name = self._normalize_skill_text(card_name)
-        for i, p in enumerate(prefs):
-            if p and (p in name or name in p):
-                return i
-        return 3
+        hit = self._matched_derivative_of(family, card_name)
+        return prefs.index(hit) if hit else 3
+
+    # 卡面标题栏只显示具体衍生名，不会出现「元素弹药」这个统称。
+    # 仅火/电/冰三种算元素弹药；生化子弹属生化系，不在此列。
+    ELEMENT_AMMO_DERIVATIVES = ("火焰子弹", "电磁子弹", "急冻子弹")
+
+    @classmethod
+    def _matched_element_ammo(cls, card_name):
+        """返回命中的元素弹药词条，未命中空串（兼容 xx/xx+ 后缀）。"""
+        name = cls._normalize_skill_text(card_name)
+        if not name:
+            return ""
+        for word in cls.ELEMENT_AMMO_DERIVATIVES:
+            if word in name:
+                return word
+        return ""
 
     def _is_excluded_skill_card(self, family, card_name):
         if not self.exclude_element_ammo:
             return False
         if family != "枪械":
             return False
-        if not card_name:
-            return False
-        return "元素弹药" in self._normalize_skill_text(card_name)
+        return bool(self._matched_element_ammo(card_name))
 
     def _preferred_skill_slots(self, img, client_centers, scale=None,
                                return_detail=False, roi_half=None, min_tpl_side=60,
-                               use_ocr=None, do_capture=False):
+                               use_ocr=None, do_capture=False, use_derivative_name=False):
         """全模式共用：按 优先技能 → 同族偏好衍生 → SKILL_LIST → 左到右 排序。
 
         图标只认大类；OCR 认卡名后，在同一 family_rank 内用衍生偏好细分。
@@ -1511,6 +1597,7 @@ class GameBot:
 
         use_ocr: None=按配置自动；翻牌等待帧传 False，最终决策帧传 True。
         do_capture: 仅最终决策时 True，避免每帧存图。
+        use_derivative_name: 读卡顶标题栏的衍生技能名（3选1 用，4选2 布局不适配）。
         """
         groups, group_names = [], []
         for templates in self.priority_skills:
@@ -1534,7 +1621,22 @@ class GameBot:
                 if s > score:
                     rank, score, best_name = prio_idx, s, group_names[prio_idx]
 
-            card_name = self._ocr_card_name(img, cx, cy) if need_ocr else ""
+            # 3选1 卡顶标题栏是衍生技能名（伤害增幅/轰炸增伤…），优先读它；
+            # 读不到再回退到图标下方的效果描述老逻辑（4选2 等布局仍走老逻辑）。
+            card_name = ""
+            if need_ocr:
+                if use_derivative_name:
+                    card_name = self._ocr_card_derivative(img, cx, cy)
+                if not card_name:
+                    card_name = self._ocr_card_name(img, cx, cy)
+            # 兜底：翻牌中途图标未翻开（模板分0→rank999），但标题栏文字已可读，
+            # 用 OCR 衍生名反查大类，避免高优先技能因图标没翻出来被排到最后。
+            if rank >= 999 and card_name:
+                guess = self._family_from_derivative(card_name)
+                if guess:
+                    rank = self._rank_of_family(guess, group_names)
+                    best_name = guess
+
             if self._is_excluded_skill_card(best_name, card_name):
                 excluded.append(slot)
                 display = f"{best_name}/{card_name or '?'}[排除]"
@@ -1544,7 +1646,10 @@ class GameBot:
                 continue
 
             deriv = self._derivative_rank_of(best_name, card_name)
+            hit_word = self._matched_derivative_of(best_name, card_name)
             display = best_name if not card_name else f"{best_name}/{card_name}"
+            if hit_word:
+                display += f"[{hit_word}]"
             # family → 衍生偏好 → 匹配分 → 卡位
             slot_rank.append((rank, deriv, -score, slot))
             detail.append((slot, rank, score, display))
@@ -1734,13 +1839,15 @@ class GameBot:
         band_roi=True(环球/主线)：用带状 ROI 罩住转盘翻牌前/后两套布局，只匹配大模板；
         band_roi=False(元素试炼)：沿用旧的 ±150/+278 点位与默认 ROI，行为不变。
 
-        翻牌判断：等三张卡都识别出来再比优先级，总等待封顶 PICK_ONE_FLIP_WAIT(1s)。
-        实测单帧识别≈0.11s，1s 内可抓 5~7 帧；超时就按当前帧已识别的卡取 rank 最优，
-        不再像旧版那样固定等 12×0.5=6s 却因 ROI/模板问题一张都认不出。
+        翻牌判断：等三张卡都识别出来再比优先级，总等待封顶 PICK_ONE_FLIP_WAIT(2s)。
+        正常翻牌≈0.6s 就三张全中立即 break；翻牌动画慢时最长等 2s，
+        避免图标没翻开就超时决策（曾因此把空投轰炸误排到最后）。
+        帧数上限按等待时长推导，确保不会因为帧数先耗尽而提前放弃等待。
         """
         max_wait = self.PICK_ONE_FLIP_WAIT
         flip_sleep = self.PICK_ONE_FLIP_INTERVAL
-        max_frames = 6  # 帧数保险；正常 1s 内约 5~7 帧，由时间上限兜底
+        # 帧数保险由时间上限推导：单帧≈识别0.11s+间隔0.2s≈0.31s，向上取整再留2帧余量
+        max_frames = max(6, int(max_wait / (flip_sleep + self.PICK_ONE_FRAME_BUDGET)) + 2)
         offsets = self._card_offsets_3_band_icon() if band_roi else self._card_offsets_3_icon()
         roi_half = (95, 115) if band_roi else None
         min_tpl_side = 60 if band_roi else 0
@@ -1787,6 +1894,7 @@ class GameBot:
             img, icon_centers, scale=self.SKILL_TPL_SCALE_PICK_ONE,
             return_detail=True, roi_half=roi_half, min_tpl_side=min_tpl_side,
             use_ocr=self._need_skill_ocr(), do_capture=True,
+            use_derivative_name=band_roi,
         )
         any_hit = [d for d in detail if d[1] < 999]
         slot = preferred[0]
@@ -1804,7 +1912,7 @@ class GameBot:
         """
         try:
             os.makedirs(self.screenshot_dir, exist_ok=True)
-            mode_name = {0: "环球", 1: "主线", 2: "普通远征", 3: "超级远征", 4: "深渊", 5: "元素"}.get(
+            mode_name = {0: "环球", 1: "主线", 2: "普通远征", 4: "深渊", 5: "元素"}.get(
                 getattr(self, "mode", -1), f"m{getattr(self, 'mode', -1)}"
             )
             safe_tag = re.sub(r"[^\w\u4e00-\u9fff-]", "", str(tag))
@@ -2890,7 +2998,7 @@ class GameBotGUI:
                     self.game_title_var.set(game_title)
                     # 加载模式
                     mode = config.get("mode", "环球")
-                    if mode in ["环球", "主线", "深渊挑战", "元素试炼", "普通远征", "超级远征"]:
+                    if mode in ["环球", "主线", "深渊挑战", "元素试炼", "普通远征"]:
                         self.mode_var.set(mode)
                     # 加载消费模式
                     rich_mode = config.get("rich_mode", 0)
@@ -2999,14 +3107,14 @@ class GameBotGUI:
         self.mode_combo = ttk.Combobox(
             self.root,
             textvariable=self.mode_var,
-            values=["环球", "主线", "深渊挑战", "元素试炼", "普通远征", "超级远征"],
+            values=["环球", "主线", "深渊挑战", "元素试炼", "普通远征"],
             width=15,
             state="readonly",
         )
         self.mode_combo.grid(row=1, column=1, padx=10, pady=5, sticky=tk.W)
         self.mode_combo.bind("<<ComboboxSelected>>", self.on_mode_changed)
 
-        # 消费模式选择（仅环球、普通远征、超级远征显示）
+        # 消费模式选择（环球/普通远征显示；普通远征不支持单人，隐藏土豪单人项）
         self.rich_mode_label = ttk.Label(self.root, text="消费模式:")
         self.rich_mode_label.grid(row=2, column=0, padx=10, pady=5, sticky=tk.W)
         self.rich_mode_frame = ttk.Frame(self.root)
@@ -3014,15 +3122,17 @@ class GameBotGUI:
         ttk.Radiobutton(
             self.rich_mode_frame, text="我是土豪（出票）", variable=self.rich_mode_var, value=0
         ).pack(side=tk.LEFT, padx=5)
-        ttk.Radiobutton(
+        self.rich_single_radio = ttk.Radiobutton(
             self.rich_mode_frame, text="土豪单人（自己开）", variable=self.rich_mode_var, value=2
-        ).pack(side=tk.LEFT, padx=5)
-        ttk.Radiobutton(
+        )
+        self.rich_single_radio.pack(side=tk.LEFT, padx=5)
+        self.rich_poor_radio = ttk.Radiobutton(
             self.rich_mode_frame, text="我是穷B（不出票）", variable=self.rich_mode_var, value=1
-        ).pack(side=tk.LEFT, padx=5)
+        )
+        self.rich_poor_radio.pack(side=tk.LEFT, padx=5)
         self.rich_mode_frame.grid(row=2, column=1, columnspan=2, padx=10, pady=5, sticky=tk.W)
 
-        # 秒退选项（仅普通远征、超级远征、主线显示）
+        # 秒退选项（仅普通远征、主线显示）
         self.quick_exit_label = ttk.Label(self.root, text="秒退模式:")
         self.quick_exit_label.grid(row=3, column=0, padx=10, pady=5, sticky=tk.W)
         self.quick_exit_var = tk.BooleanVar(value=False)
@@ -3296,16 +3406,23 @@ class GameBotGUI:
     def on_mode_changed(self, event):
         """模式选择事件，控制土豪/穷B单选框和秒退选项显示"""
         mode = self.mode_var.get()
-        # 仅环球、普通远征、超级远征显示土豪/穷B选项
-        if mode in ["环球", "普通远征", "超级远征"]:
+        # 仅环球、普通远征显示消费模式选项
+        if mode in ["环球", "普通远征"]:
             self.rich_mode_label.grid(row=2, column=0, padx=10, pady=5, sticky=tk.W)
             self.rich_mode_frame.grid(row=2, column=1, columnspan=2, padx=10, pady=5, sticky=tk.W)
+            # 远征不支持单人：隐藏「土豪单人」并回退到出票模式，避免旧配置仍按单人逻辑跑
+            if mode == "普通远征":
+                self.rich_single_radio.pack_forget()
+                if self.rich_mode_var.get() == 2:
+                    self.rich_mode_var.set(0)
+            else:
+                self.rich_single_radio.pack(side=tk.LEFT, padx=5, before=self.rich_poor_radio)
         else:
             self.rich_mode_label.grid_remove()
             self.rich_mode_frame.grid_remove()
 
-        # 仅普通远征、超级远征、主线显示秒退选项
-        if mode in ["普通远征", "超级远征", "主线"]:
+        # 仅普通远征、主线显示秒退选项
+        if mode in ["普通远征", "主线"]:
             self.quick_exit_label.grid(row=3, column=0, padx=10, pady=5, sticky=tk.W)
             self.quick_exit_check.grid(row=3, column=1, padx=10, pady=5, sticky=tk.W)
         else:
@@ -3318,7 +3435,7 @@ class GameBotGUI:
             # 获取界面参数
             game_title = self.game_title_var.get()
             mode_text = self.mode_var.get()
-            mode_map = {"环球": 0, "主线": 1, "普通远征": 2, "超级远征": 3, "深渊挑战": 4, "元素试炼": 5}
+            mode_map = {"环球": 0, "主线": 1, "普通远征": 2, "深渊挑战": 4, "元素试炼": 5}
             mode = mode_map.get(mode_text, 0)
             max_battle_count = self.max_battle_count_var.get()
             battle_time = self.battle_time_var.get()
