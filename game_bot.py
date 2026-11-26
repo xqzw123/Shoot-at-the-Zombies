@@ -51,6 +51,7 @@ class GameBot:
         background_mode=True,
         match_log_enabled=False,
         debug_mode=False,
+        recruit_click_interval=0.05,
     ):
         self.running = True
         # 单步调试模式：主循环每轮开头阻塞在 step_event，由 GUI 点"下一步"放行一轮。
@@ -135,6 +136,15 @@ class GameBot:
         self._match_log_state = {}      # {模板名: (状态桶, 上次打印时间)}
         self.MATCH_LOG_INTERVAL = 20    # 同一模板状态不变时的最短重复间隔(秒)
         self.MATCH_LOG_NEAR = 0.28      # 低于阈值但在该范围内记为"接近阈值"(重点诊断信号)
+        # 抢队：点间隔 + 按「新队伍出现」统计成功率（旧队空点不计入）
+        self.recruit_click_interval = max(0.01, float(recruit_click_interval))
+        self._recruit_prev_ys = set()
+        self._recruit_pending_since = None
+        self._recruit_new = 0
+        self._recruit_ok = 0
+        self._recruit_fail = 0
+        self.RECRUIT_RACE_SEC = 2.0
+        self.RECRUIT_Y_BUCKET = 20
         self._preload_templates()
 
         self._screenshot_bgr = None
@@ -895,6 +905,53 @@ class GameBot:
         """判断能否发现队伍页面"""
         return self.find_template("recruitment-1.png")
 
+    def _recruit_y_keys(self, positions):
+        b = self.RECRUIT_Y_BUCKET
+        return {int(round(y / b)) for _, y in positions}
+
+    def _recruit_note_new(self, positions):
+        """上一帧没有、本帧新出现的环球位 → 记一次新队机会（已在抢窗口内则不重复计）"""
+        keys = self._recruit_y_keys(positions)
+        new_keys = keys - self._recruit_prev_ys
+        self._recruit_prev_ys = keys
+        if not new_keys:
+            return
+        if self._recruit_pending_since is not None:
+            return
+        self._recruit_pending_since = time.time()
+        self._recruit_new += 1
+        print(
+            f"[抢队] 新队伍 #{self._recruit_new} "
+            f"(间隔 {self.recruit_click_interval:.2f}s)"
+        )
+
+    def _recruit_settle(self, in_team):
+        """结算进行中的新队窗口：进队=成功，超时=失败"""
+        if self._recruit_pending_since is None:
+            return False
+        now = time.time()
+        if in_team:
+            self._recruit_ok += 1
+            self._recruit_pending_since = None
+            self._print_recruit_stats("抢中")
+            return True
+        if now - self._recruit_pending_since >= self.RECRUIT_RACE_SEC:
+            self._recruit_fail += 1
+            self._recruit_pending_since = None
+            self._print_recruit_stats("未中")
+        return False
+
+    def _print_recruit_stats(self, event=None):
+        n = self._recruit_new
+        ok = self._recruit_ok
+        rate = (100.0 * ok / n) if n else 0.0
+        prefix = f"[抢队] {event} · " if event else "[抢队] "
+        print(
+            f"{prefix}新队 {n} · 抢中 {ok} · "
+            f"未中 {self._recruit_fail} · 成功率 {rate:.0f}% · "
+            f"间隔 {self.recruit_click_interval:.2f}s"
+        )
+
     def find_click_recruitment(self):
         while True and self.running:
             """判断能否点击招募页面"""
@@ -913,19 +970,29 @@ class GameBot:
                     break
             self.find_click_reconnection()
             for i in range(20):
+                if not self.running:
+                    break
                 try:
                     huanqiu_positions = self.find_all_templates("huanqiu.png")
                     if huanqiu_positions:
+                        self._recruit_note_new(huanqiu_positions)
                         # 使用快速点击方法点击所有找到的环球按钮
                         positions = []
                         for pos in huanqiu_positions:
                             pos = (pos[0] + 150, pos[1])
                             positions.append(pos)
                         if positions:
-                            # 倒序连点，间隔保持短，优先抢队速度
+                            # 倒序连点，间隔可配，优先抢队速度
                             positions.reverse()
-                            self.click_fast_batch(positions, interval=0.05)
+                            self.click_fast_batch(
+                                positions, interval=self.recruit_click_interval
+                            )
+                        if self._recruit_settle(self.find_in_huanqiu_team()):
+                            return
                     else:
+                        self._recruit_prev_ys = set()
+                        if self._recruit_settle(self.find_in_huanqiu_team()):
+                            return
                         leave_button = self.find_leave_button()
                         if leave_button:
                             if not self.find_in_huanqiu_team():
@@ -935,6 +1002,7 @@ class GameBot:
                         # 不打深渊
                         if self.find_double_abyss():
                             self.find_click_dont_battle_return()
+                    self._recruit_settle(False)
                 except Exception:
                     # 兜底：单次异常不影响主循环，节流打印
                     now = time.time()
@@ -2344,6 +2412,8 @@ class GameBotGUI:
                     # 加载战斗时间
                     battle_time = config.get("battle_time", 0)
                     self.battle_time_var.set(battle_time)
+                    recruit_click_interval = config.get("recruit_click_interval", 0.05)
+                    self.recruit_interval_var.set(recruit_click_interval)
                     # 加载优先技能配置
                     priority_skills = config.get("priority_skills", [])
                     for i, skill_name in enumerate(priority_skills):
@@ -2367,6 +2437,7 @@ class GameBotGUI:
                 "debug_mode": self.debug_mode_var.get(),
                 "max_battle_count": self.max_battle_count_var.get(),
                 "battle_time": self.battle_time_var.get(),
+                "recruit_click_interval": self.recruit_interval_var.get(),
                 "priority_skills": [var.get() for var in self.priority_skill_vars]
             }
             with open(self.CONFIG_FILE, "w", encoding="utf-8") as f:
@@ -2375,7 +2446,7 @@ class GameBotGUI:
             print(f"保存配置失败: {e}")
 
     def create_widgets(self):
-        for i in range(16):
+        for i in range(17):
             self.root.grid_rowconfigure(i, minsize=40)
 
         # 游戏标题
@@ -2487,6 +2558,25 @@ class GameBotGUI:
             row=5, column=2, padx=5, pady=5, sticky=tk.W
         )
 
+        ttk.Label(self.root, text="抢队点间隔(秒):").grid(
+            row=6, column=0, padx=10, pady=5, sticky=tk.W
+        )
+        self.recruit_interval_var = tk.DoubleVar(value=0.05)
+        self.recruit_interval_spinbox = ttk.Spinbox(
+            self.root,
+            from_=0.02,
+            to=0.2,
+            increment=0.01,
+            textvariable=self.recruit_interval_var,
+            width=10,
+        )
+        self.recruit_interval_spinbox.grid(
+            row=6, column=1, padx=10, pady=5, sticky=tk.W
+        )
+        ttk.Label(self.root, text="(新队抢中率对比用)").grid(
+            row=6, column=2, padx=5, pady=5, sticky=tk.W
+        )
+
         # 优先技能选项（5个）
         ttk.Label(self.root, text="优先技能(从上到下):").grid(
             row=7, column=0, padx=10, pady=5, sticky=tk.W
@@ -2508,16 +2598,16 @@ class GameBotGUI:
                 width=15,
                 state="readonly",
             )
-            combo.grid(row=6 + i, column=1, padx=10, pady=3, sticky=tk.W)
+            combo.grid(row=7 + i, column=1, padx=10, pady=3, sticky=tk.W)
             combo.bind("<<ComboboxSelected>>", self.on_skill_selected)
             self.priority_skill_combos.append(combo)
             ttk.Label(self.root, text=f"优先级{i+1}").grid(
-                row=6 + i, column=2, padx=5, pady=3, sticky=tk.W
+                row=7 + i, column=2, padx=5, pady=3, sticky=tk.W
             )
 
         # 按钮框架
         button_frame = ttk.Frame(self.root)
-        button_frame.grid(row=11, column=0, columnspan=3, padx=10, pady=20)
+        button_frame.grid(row=12, column=0, columnspan=3, padx=10, pady=20)
 
         # 开始按钮
         self.start_btn = ttk.Button(
@@ -2560,24 +2650,24 @@ class GameBotGUI:
         # 状态标签
         self.status_var = tk.StringVar(value="就绪")
         ttk.Label(self.root, textvariable=self.status_var, foreground="green").grid(
-            row=12, column=0, columnspan=3, padx=10, pady=10, sticky=tk.W
+            row=13, column=0, columnspan=3, padx=10, pady=10, sticky=tk.W
         )
 
         # 战斗次数标签
         self.battle_count_var = tk.StringVar(value="战斗次数: 0")
         ttk.Label(
             self.root, textvariable=self.battle_count_var, foreground="blue"
-        ).grid(row=13, column=0, columnspan=3, padx=10, pady=5, sticky=tk.W)
+        ).grid(row=14, column=0, columnspan=3, padx=10, pady=5, sticky=tk.W)
 
         # 提示标签
         ttk.Label(self.root, text="提示: 按ESC键暂停脚本", foreground="blue").grid(
-            row=14, column=0, columnspan=3, padx=10, pady=5, sticky=tk.W
+            row=15, column=0, columnspan=3, padx=10, pady=5, sticky=tk.W
         )
 
         # 控制台输出区域
         console_frame = ttk.LabelFrame(self.root, text="控制台输出")
-        console_frame.grid(row=15, column=0, columnspan=3, padx=10, pady=10, sticky=tk.W + tk.E + tk.N + tk.S)
-        self.root.grid_rowconfigure(15, minsize=150)
+        console_frame.grid(row=16, column=0, columnspan=3, padx=10, pady=10, sticky=tk.W + tk.E + tk.N + tk.S)
+        self.root.grid_rowconfigure(16, minsize=150)
 
         self.console_text = scrolledtext.ScrolledText(
             console_frame, width=70, height=8, state=tk.NORMAL, wrap=tk.WORD
@@ -2675,10 +2765,15 @@ class GameBotGUI:
                 self.background_mode_var.get(),
                 self.match_log_var.get(),
                 debug_mode,
+                self.recruit_interval_var.get(),
             )
             self.bot.on_battle_count_changed = self._update_battle_count
             if self.match_log_var.get():
                 print("[匹配日志] 已开启：模板匹配分数将记录到 bot.log")
+            print(
+                f"[抢队] 点间隔 {self.recruit_interval_var.get():.2f}s，"
+                f"按新队伍出现统计抢中率"
+            )
 
             # 更新状态
             if debug_mode:
@@ -2702,6 +2797,7 @@ class GameBotGUI:
             self.debug_mode_check.config(state=tk.DISABLED)
             self.max_battle_count_spinbox.config(state=tk.DISABLED)
             self.battle_time_spinbox.config(state=tk.DISABLED)
+            self.recruit_interval_spinbox.config(state=tk.DISABLED)
             for combo in self.priority_skill_combos:
                 combo.config(state=tk.DISABLED)
             self.resize_btn.config(state=tk.DISABLED)
@@ -2744,6 +2840,8 @@ class GameBotGUI:
             self.bot.running = False
             # 单步模式下线程可能阻塞在 step_event.wait()，唤醒它以便线程退出
             self.bot.step_event.set()
+            if self.bot._recruit_new:
+                self.bot._print_recruit_stats("本轮汇总")
             self.bot = None
 
         # 更新状态
@@ -2763,6 +2861,7 @@ class GameBotGUI:
         self.debug_mode_check.config(state=tk.NORMAL)
         self.max_battle_count_spinbox.config(state=tk.NORMAL)
         self.battle_time_spinbox.config(state=tk.NORMAL)
+        self.recruit_interval_spinbox.config(state=tk.NORMAL)
         for combo in self.priority_skill_combos:
             combo.config(state=tk.NORMAL)
         self.resize_btn.config(state=tk.NORMAL)
