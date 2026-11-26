@@ -439,5 +439,53 @@ class TestHeartbeatStartLock(LicensingTestCase):
                          "并发 start_heartbeat 起了 %d 个线程" % len(created))
 
 
+class TestOcrRuntimePackaging(LicensingTestCase):
+    """新版 game_bot.py 用 rapidocr-onnxruntime 选技能，模型必须随包发布。"""
+
+    def test_build_command_includes_rapidocr_resources(self):
+        """构建命令必须把 rapidocr 包目录作为数据文件打进去。"""
+        br = load_build_release()
+        cmd = br.pyinstaller_cmd()
+        joined = " ".join(str(x) for x in cmd)
+        self.assertIn("rapidocr", joined.lower(),
+                      "构建命令未包含 rapidocr 数据文件，客户机 OCR 会失败")
+
+    def test_preflight_checks_ocr_resources(self):
+        """发布前检查要能发现缺失的 OCR 模型。"""
+        br = load_build_release()
+        self.assertTrue(hasattr(br, "ocr_resource_problems"))
+        problems = br.ocr_resource_problems()
+        self.assertEqual(problems, [], "当前打包环境的 OCR 资源应完整：%s" % problems)
+
+    def test_dist_allows_ocr_models_but_still_rejects_py(self):
+        """rapidocr 目录只放行 .onnx/.yaml 数据文件，塞 .py 仍须被拦。"""
+        import tempfile
+        br = load_build_release()
+        with tempfile.TemporaryDirectory() as tmp:
+            ocr_dir = os.path.join(tmp, "_internal", "rapidocr_onnxruntime", "models")
+            os.makedirs(ocr_dir)
+            with open(os.path.join(ocr_dir, "det.onnx"), "wb") as fh:
+                fh.write(b"x")
+            with mock.patch.object(br, "OUT_DIR", tmp):
+                self.assertEqual(br.dist_problems(), [])
+                with open(os.path.join(ocr_dir, "evil.py"), "wb") as fh:
+                    fh.write(b"x")
+                problems = br.dist_problems()
+            self.assertTrue(any("evil.py" in p for p in problems),
+                            "rapidocr 目录放了 .py 未被拦：%s" % problems)
+
+    def test_built_dist_contains_onnx_models(self):
+        """已构建产物里必须有 .onnx 模型，否则选技能功能失效。"""
+        br = load_build_release()
+        if not os.path.isdir(br.OUT_DIR):
+            self.skipTest("尚未构建")
+        models = []
+        for base, _dirs, files in os.walk(br.OUT_DIR):
+            for name in files:
+                if name.lower().endswith(".onnx"):
+                    models.append(os.path.relpath(os.path.join(base, name), br.OUT_DIR))
+        self.assertTrue(models, "发布包缺少 OCR 模型文件，客户机选技能会失效")
+
+
 if __name__ == "__main__":
     unittest.main()

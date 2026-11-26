@@ -41,7 +41,10 @@ def show_activation_dialog(parent: tk.Misc | None, reason: str | None = None) ->
     dialog = tk.Toplevel(parent)
     dialog.title("产品激活")
     dialog.geometry("680x680")
-    dialog.transient(parent)
+    # 不能 transient 到主窗口：launcher 启动时会 root.withdraw() 隐藏主窗口，
+    # Windows 上 Toplevel 依附隐藏的 transient master 会一并变成 withdrawn，
+    # 导致激活窗口永远不显示、程序卡在 wait_window（双击 exe 像没反应）。
+    # 激活对话框本就是独立模态窗口，grab_set + lift 已足够保证它floating在最前。
     result = {"ok": False}
 
     pad = {"padx": 10, "pady": 5}
@@ -57,11 +60,13 @@ def show_activation_dialog(parent: tk.Misc | None, reason: str | None = None) ->
     machine = fingerprint.machine_code()
     request_text = license_core.build_request()
 
-    ttk.Label(dialog, text="机器码（发给作者）", font=("TkDefaultFont", 10, "bold")).pack(anchor="w", **pad)
+    # 激活请求里已含机器码（mid 字段），签发器只吃请求；机器码仅留作对账核对，
+    # 不再单独提供复制按钮，避免客户误以为要发两段内容。
+    ttk.Label(dialog, text="机器码（供核对，无需发送）",
+              font=("TkDefaultFont", 10, "bold")).pack(anchor="w", **pad)
     row = ttk.Frame(dialog)
     row.pack(fill="x", **pad)
     ttk.Label(row, text=machine, font=("Consolas", 14)).pack(side="left")
-    ttk.Button(row, text="复制机器码", command=lambda: _copy(dialog, machine)).pack(side="left", padx=8)
 
     ttk.Label(dialog, text="激活请求（复制这一段，或导出文件发给作者）").pack(anchor="w", **pad)
     req_box = scrolledtext.ScrolledText(dialog, height=5)

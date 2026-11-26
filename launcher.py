@@ -20,6 +20,51 @@ from licensing import clock, license_core, state_store
 _TIME_CALIBRATION_REASONS = ("回拨", "校准", "联网")
 MAX_CALIBRATION_GRACE_TICKS = 10   # 时间校准类失败最多豁免 10 分钟，不能无限豁免
 
+# OpenCV 在 Windows 上用 cv2.imread 读中文路径会静默返回 None（imread_ 用
+# 窄字符 API 打不开），客户把程序装到中文目录时 115 张模板会全部加载失败。
+# 发布入口统一打补丁：ASCII 路径保持原函数，非 ASCII 路径改用 np.fromfile +
+# imdecode（走宽字符文件 API）。不改 game_bot.py，维持零侵入接入。
+_ORIGINAL_IMREAD = None
+
+
+def imread_unicode(path, *args, **kwargs):
+    """兼容中文路径的图片读取，行为对齐 cv2.imread。"""
+    global _ORIGINAL_IMREAD
+    import cv2
+    import numpy as np
+    if _ORIGINAL_IMREAD is None:
+        _ORIGINAL_IMREAD = cv2.imread
+    # 只有路径含非 ASCII 字符才走 imdecode；ASCII 路径完全保持原语义。
+    if isinstance(path, str) and path.isascii():
+        return _ORIGINAL_IMREAD(path, *args, **kwargs)
+    try:
+        data = np.fromfile(path, dtype=np.uint8)
+        if data.size == 0:
+            return None
+        return cv2.imdecode(data, cv2.IMREAD_COLOR if not args else args[0])
+    except (OSError, ValueError, cv2.error):
+        return None
+
+
+def patch_cv2_imread() -> None:
+    """把 cv2.imread 换成支持中文路径的版本（幂等）。"""
+    global _ORIGINAL_IMREAD
+    import cv2
+    if cv2.imread is imread_unicode:
+        return  # 已打过补丁
+    if _ORIGINAL_IMREAD is None:
+        _ORIGINAL_IMREAD = cv2.imread
+    cv2.imread = imread_unicode
+
+
+def restore_cv2_imread() -> None:
+    """恢复原始 cv2.imread（供测试隔离）。"""
+    global _ORIGINAL_IMREAD
+    import cv2
+    if _ORIGINAL_IMREAD is not None:
+        cv2.imread = _ORIGINAL_IMREAD
+        _ORIGINAL_IMREAD = None
+
 
 def _report_startup_error(message: str, show_dialog: bool = True) -> None:
     """公钥自检/资源定位失败时给出可读提示，避免客户只看到进程闪退。"""
@@ -162,6 +207,9 @@ def _make_watchdog(root, gui):
 
 def main() -> int:
     _prepare_paths()
+    # 中文安装路径兼容：必须在 import game_bot 之前打补丁，
+    # 否则 game_bot 模块加载的模板会走有缺陷的 cv2.imread。
+    patch_cv2_imread()
     import tkinter as tk
 
     root = tk.Tk()

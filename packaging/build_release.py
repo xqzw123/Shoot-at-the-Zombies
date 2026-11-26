@@ -48,9 +48,63 @@ _THIRD_PARTY_ROOTS = {"cv2", "numpy", "PIL", "win32", "pywin32",
                       "_tcl_data", "_tk_data", "tcl8", "tk8",
                       "numpy.libs", "torch", "scipy", "matplotlib"}
 _CONTAINER_DIRS = {"_internal"}
+# rapidocr 的 config.yaml / .onnx 是构建期 --collect-data 收进来的合法数据文件。
+# 只放行这两个后缀；该目录里若出现 .py/.jsonl 等一律仍按敏感文件拦，不放水。
+_OCR_DATA_ROOTS = {"rapidocr_onnxruntime"}
+_OCR_DATA_SUFFIXES = (".onnx", ".yaml")
+# rapid_ocr_api.py 按 config.yaml 的 module_name 字符串动态 import 这三个子包，
+# PyInstaller 静态分析看不到；必须显式 hidden-import，否则产物里 import 到的是
+# 只有 config.yaml 的 namespace package，报 "has no attribute 'TextDetector'"。
+_OCR_DYNAMIC_MODULES = ("ch_ppocr_v3_det", "ch_ppocr_v3_rec", "ch_ppocr_v2_cls")
 _ALWAYS_SUSPICIOUS_SUFFIXES = (".lic", ".revoke", ".pem", ".key",
                                ".jsonl", ".csv", ".bak", ".log")
 _ALLOWED_PROJECT_FILES = {"license.txt", "readme.txt"}
+
+# 发布包瘦身：以下二进制由 PyInstaller hook 自动收集，但本程序从不使用，
+# 合计约 48 MB。构建后统一剔除；规则用「子目录 + 文件名正则」精确匹配，
+# 不按大小/扩展名一刀切，避免误删 imread 依赖的 cv2.pyd 或 OCR 模型。
+PRUNABLE_BINARIES: tuple[tuple[str, "re.Pattern[str]"], ...] = (
+    # OpenCV 的 videoio ffmpeg 插件：只有 VideoCapture/VideoWriter 才加载；
+    # 本程序只做 cv2.imread + pyautogui 截图，不碰视频 I/O。
+    ("cv2", re.compile(r"^opencv_videoio_ffmpeg.*\.dll$", re.I)),
+    # Pillow 的 AVIF 编解码插件：只有读写 .avif 才用；本项目图片均为 png/jpg。
+    ("PIL", re.compile(r"^_avif.*\.pyd$", re.I)),
+)
+
+
+def _internal_dir(root: str | None = None) -> str:
+    """定位 _internal 目录：传入 OUT_DIR 或 _internal 本身都能工作。"""
+    base = root or OUT_DIR
+    candidate = os.path.join(base, "_internal")
+    return candidate if os.path.isdir(candidate) else base
+
+
+def prunable_leftovers(root: str | None = None) -> list[str]:
+    """列出尚未剔除的冗余二进制（相对 _internal 的路径）。"""
+    internal = _internal_dir(root)
+    leftovers = []
+    for subdir, pattern in PRUNABLE_BINARIES:
+        folder = os.path.join(internal, subdir)
+        if not os.path.isdir(folder):
+            continue
+        for name in os.listdir(folder):
+            if pattern.match(name):
+                leftovers.append(os.path.join(subdir, name))
+    return sorted(leftovers)
+
+
+def prune_release(root: str | None = None) -> list[str]:
+    """从发布产物剔除冗余二进制，返回被删除文件的相对路径列表。"""
+    internal = _internal_dir(root)
+    removed = []
+    for rel in prunable_leftovers(internal):
+        path = os.path.join(internal, rel)
+        try:
+            os.remove(path)
+        except OSError as exc:
+            raise RuntimeError("剔除冗余文件失败 %s：%s" % (rel, exc)) from exc
+        removed.append(rel)
+    return removed
 
 
 def _read_text(path: str) -> str:
@@ -135,6 +189,13 @@ def dist_problems() -> list[str]:
         for name in files:
             rel = os.path.relpath(os.path.join(base, name), OUT_DIR)
             lower = name.lower()
+            # rapidocr 数据文件目录：只允许 .onnx/.yaml，其余（含 .py）仍拦。
+            parts = [p for p in rel.replace("/", "\\").split("\\") if p]
+            if any(p in _OCR_DATA_ROOTS for p in parts):
+                if not lower.endswith(_OCR_DATA_SUFFIXES) or lower.endswith(
+                        _ALWAYS_SUSPICIOUS_SUFFIXES):
+                    hits.append(rel)
+                continue
             if lower in _SENSITIVE_NAMES or lower in _ALLOWED_PROJECT_FILES:
                 if lower in _SENSITIVE_NAMES:
                     hits.append(rel)
@@ -225,10 +286,55 @@ def anchor_vcs_problems() -> list[str]:
                 "licensing/state_secret.fingerprint 在 HEAD 中" % (exc,)]
 
 
+def _rapidocr_source_dir() -> str | None:
+    """定位 rapidocr-onnxruntime 包目录（含 config.yaml 与 .onnx 模型）。"""
+    sys.path.insert(0, ROOT)
+    try:
+        import rapidocr_onnxruntime
+        return os.path.dirname(os.path.abspath(rapidocr_onnxruntime.__file__))
+    except Exception:
+        return None
+
+
+def ocr_resource_problems() -> list[str]:
+    """OCR 模型必须随包发布，否则客户机选技能时 RapidOCR() 抛 FileExistsError。"""
+    source = _rapidocr_source_dir()
+    if source is None:
+        return ["未安装 rapidocr-onnxruntime：python -m pip install rapidocr-onnxruntime"]
+    models = []
+    for base, _dirs, files in os.walk(source):
+        for name in files:
+            if name.lower().endswith(".onnx"):
+                models.append(os.path.join(base, name))
+    if not models:
+        return ["rapidocr-onnxruntime 包内没有 .onnx 模型，OCR 选技能将失效"]
+    if not os.path.isfile(os.path.join(source, "config.yaml")):
+        return ["rapidocr-onnxruntime 包内缺少 config.yaml，OCR 选技能将失效"]
+    return []
+
+
+def ocr_dynamic_import_problems() -> list[str]:
+    """校验构建命令收集了动态导入的 OCR 子包，防止产物里 TextDetector 缺失。"""
+    cmd = [str(x) for x in pyinstaller_cmd()]
+    problems = []
+    if "--paths" not in cmd:
+        problems.append("构建命令缺少 --paths，PyInstaller 无法定位顶层 ch_ppocr_* 子包")
+    else:
+        idx = cmd.index("--paths")
+        if idx + 1 >= len(cmd) or "rapidocr_onnxruntime" not in cmd[idx + 1]:
+            problems.append("--paths 未指向 rapidocr_onnxruntime 包目录")
+    for mod in _OCR_DYNAMIC_MODULES:
+        if mod not in cmd:
+            problems.append("构建命令缺少 --hidden-import %s，客户机 OCR 初始化会失败" % mod)
+    return problems
+
+
 def preflight(engine: str, require_tools: bool = True) -> list[str]:
     problems = []
     if not os.path.isdir(os.path.join(ROOT, "templates")):
         problems.append("templates/ 不存在")
+    problems.extend(ocr_resource_problems())
+    problems.extend(ocr_dynamic_import_problems())
     if not os.path.isfile(os.path.join(ROOT, "launcher.py")):
         problems.append("发布入口 launcher.py 不存在（禁止用 game_bot.py 打包）")
     private = os.path.join(ROOT, "licensing", "keys", "private.json")
@@ -248,6 +354,10 @@ def preflight(engine: str, require_tools: bool = True) -> list[str]:
     problems.extend(_state_secret_problems())
     problems.extend(dist_problems())
     problems.extend(pyz_state_secret_problems())
+    leftovers = prunable_leftovers()
+    if leftovers:
+        print("[WARN] 发布产物含未剔除的冗余二进制（%s）；"
+              "下次构建会自动清理" % ", ".join(leftovers))
     for warn in anchor_vcs_problems():
         print("[WARN] " + warn)
     if require_tools:
@@ -258,14 +368,32 @@ def preflight(engine: str, require_tools: bool = True) -> list[str]:
     return problems
 
 
-def build_pyinstaller() -> None:
-    # 清空旧的发布目录，避免上次构建的 DLL / 调试残留被 installer 递归收进去。
-    shutil.rmtree(OUT_DIR, ignore_errors=True)
+def pyinstaller_cmd() -> list[str]:
+    """构造 PyInstaller 命令（抽成函数便于回归测试验证数据文件齐全）。"""
     cmd = [
         sys.executable, "-m", "PyInstaller", "--noconfirm", "--clean",
         "--onedir", "--windowed", "--name", APP_NAME,
         # 源路径必须绝对：--specpath 在别处时，PyInstaller 会相对 spec 目录解析相对路径
         "--add-data", os.path.join(ROOT, "templates") + os.pathsep + "templates",
+    ]
+    # rapidocr-onnxruntime 的 config.yaml 与 .onnx 模型是数据文件，PyInstaller
+    # 静态分析不会自动收集；缺了它们客户机首次调用 RapidOCR() 直接抛 FileExistsError。
+    # 用 --collect-data 只收数据文件、不带第三方 .py 源码，且目标路径正好是
+    # rapidocr_onnxruntime/... 的包内相对结构（RapidOCR 按 __file__ 定位模型）。
+    rapidocr_dir = _rapidocr_source_dir()
+    if rapidocr_dir:
+        cmd.extend([
+            "--collect-data", "rapidocr_onnxruntime",
+            "--hidden-import", "rapidocr_onnxruntime",
+            # rapid_ocr_api.py 按 config.yaml 的 module_name 字符串 import 三个
+            # 顶层子包（ch_ppocr_*），静态分析看不到。--paths 让分析阶段能定位
+            # 顶层包，三个 hidden-import 把它们和 text_detect 等子模块收进 PYZ。
+            # 实测：缺任一项，frozen 产物报 "has no attribute 'TextDetector'"。
+            "--paths", rapidocr_dir,
+        ])
+        for mod in _OCR_DYNAMIC_MODULES:
+            cmd.extend(["--hidden-import", mod])
+    cmd.extend([
         "--hidden-import", "win32timezone",
         # 构建期生成的状态密钥模块：显式声明，避免静态分析漏收导致发布包
         # 解不开老客户的 state.json（覆盖安装后被迫重新授权）
@@ -274,12 +402,23 @@ def build_pyinstaller() -> None:
         "--workpath", os.path.join(ROOT, "build", "pyinstaller"),
         "--specpath", os.path.join(ROOT, "build", "spec"),
         "launcher.py",
-    ]
+    ])
+    return cmd
+
+
+def build_pyinstaller() -> None:
+    # 清空旧的发布目录，避免上次构建的 DLL / 调试残留被 installer 递归收进去。
+    shutil.rmtree(OUT_DIR, ignore_errors=True)
+    cmd = pyinstaller_cmd()
     print("执行：", " ".join(cmd))
     subprocess.check_call(cmd, cwd=ROOT)
     leaks = dist_problems() + pyz_state_secret_problems()
     if leaks:
         raise RuntimeError("构建产物含敏感文件，禁止打包：\n  " + "\n  ".join(leaks))
+    removed = prune_release()
+    if removed:
+        print("已剔除 %d 个冗余二进制（约 48 MB）：%s"
+              % (len(removed), ", ".join(removed)))
     print("\n完成：%s" % os.path.join(OUT_DIR, APP_NAME + ".exe"))
     print("下一步：用 packaging/installer.iss 制作 setup.exe，并在干净虚拟机验收。")
 

@@ -35,7 +35,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 ; 绝不递归打包 dist 下其它文件，避免误把私钥/台账/调试日志收进 setup.exe。
 ; 只覆盖程序文件，绝不触碰 %APPDATA%\ShootAtZombies
 Source: "..\dist\ShootAtZombies\ShootAtZombies.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "..\dist\ShootAtZombies\_internal\*"; DestDir: "{app}\_internal"; Flags: ignoreversion recursedirs createallsubdirs
+Source: "..\dist\ShootAtZombies\_internal\*"; DestDir: "{app}\_internal"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 ; 撤销令不随安装包自动下发：退款流程中由客户在激活窗口手动导入。
 ; 客户端也会扫描 {app}\revocations 与状态目录，但那需要作者自行投递文件，
