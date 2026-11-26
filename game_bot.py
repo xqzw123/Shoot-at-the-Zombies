@@ -457,51 +457,12 @@ class GameBot:
             win32gui.PostMessage(hwnd, win32con.WM_KEYUP, vk, lparam_up)
             print(f"后台按下按键: {key}")
 
-    def _is_wechat_hwnd(self, hwnd):
-        """微信主窗/聊天窗。把焦点塞回去会打断输入框，初版是 SetForeground 失败后才不影响微信。"""
-        if not hwnd:
-            return False
-        try:
-            cls = win32gui.GetClassName(hwnd) or ""
-            if "WeChat" in cls or "Weixin" in cls or cls.startswith("mmui::"):
-                return True
-            title = win32gui.GetWindowText(hwnd) or ""
-            if title in ("微信", "WeChat", "Weixin"):
-                return True
-            _, pid = win32process.GetWindowThreadProcessId(hwnd)
-            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
-            handle = ctypes.windll.kernel32.OpenProcess(
-                PROCESS_QUERY_LIMITED_INFORMATION, False, pid
-            )
-            if not handle:
-                return False
-            try:
-                buf = ctypes.create_unicode_buffer(520)
-                size = ctypes.c_ulong(len(buf))
-                ok = ctypes.windll.kernel32.QueryFullProcessImageNameW(
-                    handle, 0, buf, ctypes.byref(size)
-                )
-                if ok:
-                    exe = os.path.basename(buf.value).lower()
-                    return exe in ("wechat.exe", "weixin.exe")
-            finally:
-                ctypes.windll.kernel32.CloseHandle(handle)
-        except Exception:
-            return False
-        return False
-
     def _restore_foreground(self, target_hwnd):
         """把前台还给指定窗口（AttachThreadInput绕过前台锁定限制）
-        注意：pywin32 312 的 win32api 没有 AttachThreadInput，必须走 ctypes.user32
-        微信聊天窗不还焦点：成功 SetForeground 会让输入框光标乱跳、打不了字。
+        注意：pywin32 312 的 win32api 没有 AttachThreadInput，必须走 ctypes.user32。
+        微信也走这条：开头可能抢一下；SetForeground 失败（错误 87）后系统锁前台，游戏不再抢回去。
         """
         if not target_hwnd or not win32gui.IsWindow(target_hwnd) or win32gui.IsIconic(target_hwnd):
-            return
-        if self._is_wechat_hwnd(target_hwnd):
-            now = time.time()
-            if now - getattr(self, "_last_wechat_fg_log", 0) >= 5:
-                self._last_wechat_fg_log = now
-                print("微信窗口只压回游戏，不归还焦点")
             return
         try:
             cur_thread = win32api.GetCurrentThreadId()
