@@ -129,6 +129,17 @@ dmypy.json
 .pyre/
 
 # 项目特定文件
+# 授权私钥与签发台账：绝不提交，私钥丢失后所有已发许可无法续签
+licensing/keys/
+# 构建期注入的状态封装密钥（由 keygen init / init-state-secret 生成，不进公开源码）
+licensing/state_secret.py
+.workbuddy/
+out/
+*.lic
+*.revoke
+# 本地素材/截图，避免 git add -A 时误入版本库
+邀请素材/
+
 screenshots/
 *.log
 游戏机器人.spec

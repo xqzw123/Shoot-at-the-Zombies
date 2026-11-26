@@ -1,5 +1,7 @@
 @echo off
 chcp 65001 >nul
+REM [DEPRECATED for release] 开发调试入口，直接跑 game_bot.py，不含授权校验。
+REM 正式发布必须用 launcher.py 作为打包入口：python packaging/build_release.py
 cd /d "%~dp0"
 echo ============================================
 echo  Shoot-at-the-Zombies
