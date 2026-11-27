@@ -3056,7 +3056,7 @@ class GameBotGUI:
         lic_btns.grid(row=0, column=2, padx=4, pady=5, sticky=tk.E)
         ttk.Button(lic_btns, text="复制激活请求", command=self._copy_activation_request).pack(side=tk.LEFT, padx=2)
         ttk.Button(lic_btns, text="导入激活码", command=self._import_license).pack(side=tk.LEFT, padx=2)
-        ttk.Button(lic_btns, text="导入退款码", command=self._open_refund).pack(side=tk.LEFT, padx=2)
+        ttk.Button(lic_btns, text="授权注销", command=self._open_refund).pack(side=tk.LEFT, padx=2)
 
         # 模式选择
         ttk.Label(self.root, text="模式:").grid(
@@ -3546,7 +3546,7 @@ class GameBotGUI:
         self.status_var.set("已导入新激活码：%s" % text)
 
     def _open_refund(self):
-        """激活之后导入退款码；回执关掉后退出，避免停用后还能继续用。"""
+        """激活之后做授权注销；回执关掉后退出，避免停用后还能继续用。"""
         from licensing import activation_ui
         activation_ui.show_revocation_dialog(self.root, on_disabled=self.quit_app)
 

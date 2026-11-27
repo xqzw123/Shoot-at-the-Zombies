@@ -307,7 +307,7 @@ def show_revocation_dialog(parent: tk.Misc | None, on_disabled=None) -> None:
         own_root = True
 
     dialog = tk.Toplevel(parent)
-    dialog.title("导入退款码")
+    dialog.title("授权注销")
     dialog.geometry("560x320")
     pad = {"padx": 10, "pady": 5}
     try:
