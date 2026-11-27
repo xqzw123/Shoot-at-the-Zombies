@@ -267,7 +267,7 @@ class TestReleaseGuardsRound6(LicensingTestCase):
         br = load_build_release()
         root = self.tmp.name
         rels = (
-            "ShootAtZombies.exe",
+            "jiangshikaipao.exe",
             os.path.join("_internal", "VCRUNTIME140.dll"),
             os.path.join("_internal", "_socket.pyd"),
             os.path.join("_internal", "base_library.zip"),
@@ -357,8 +357,8 @@ class TestRound6FollowUps(LicensingTestCase):
         """GUI 生成撤销令时 NTP 不可信不能让异常从 Tk 回调逸出。"""
         from licensing import keygen_ui
         win = keygen_ui.KeygenWindow.__new__(keygen_ui.KeygenWindow)
-        win.order_var = mock.Mock()
-        win.order_var.get.return_value = "A001"
+        win.machine_var = mock.Mock()
+        win.machine_var.get.return_value = "A001"
         win.status = mock.Mock()
         win._set_output = mock.Mock()
         win.show_ledger = mock.Mock()

@@ -19,6 +19,16 @@ class TestKeygen(LicensingTestCase):
         self.assertEqual(rows[0]["seq"], 1)
         self.assertTrue(rows[0]["request_text"])
 
+    def test_second_code_for_same_machine_gets_next_seq(self):
+        first = keygen.issue_for_request(self.request(), "timed", 7 * 86400)
+        second = keygen.issue_for_request(self.request(), "timed", 30 * 86400)
+        _, first_payload, _ = rsa_sign.verify_token(first, self.pub)
+        ok, payload, reason = rsa_sign.verify_token(second, self.pub)
+        self.assertTrue(ok, reason)
+        self.assertEqual(payload["seq"], first_payload["seq"] + 1)
+        self.assertEqual(payload["order"], first_payload["mid"])
+        self.assertEqual(payload["duration_seconds"], 30 * 86400)
+
     def test_duplicate_initial_issue_rejected(self):
         self.issue()
         with self.assertRaises(ValueError):
@@ -104,8 +114,9 @@ class TestKeygen(LicensingTestCase):
                    for n in tree.body if isinstance(n, ast.ClassDef)}
         self.assertIn("launch", functions)
         self.assertIn("KeygenWindow", classes)
-        self.assertTrue({"do_sign", "do_renew", "do_revoke", "do_verify"}
+        self.assertTrue({"do_sign", "do_revoke", "do_verify"}
                         <= classes["KeygenWindow"])
+        self.assertNotIn("do_renew", classes["KeygenWindow"])
 
 
 class TestLedgerIsolation(LicensingTestCase):

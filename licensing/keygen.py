@@ -275,6 +275,21 @@ def issue(order: str, request_text: str, type: str = "perpetual",
     return token
 
 
+def issue_for_request(request_text: str, type: str = "timed",
+                      duration_seconds: int = 0, **kwargs) -> str:
+    """按机器请求码（机器码）签发。同一台机器再签发一张新码，seq 自动加一。
+
+    客户粘贴新码即可替换当前授权，不需要续期号，也没有单独的续期步骤。
+    seq 按该机器 mid 在台账中的历史签发累计（含旧订单号），避免换单号后又从 1 起号。
+    """
+    request = fingerprint.parse_request(request_text)
+    mid = request["mid"]
+    rows = [r for r in read_ledger()
+            if r.get("kind") == "issue" and (r.get("mid") == mid or r.get("order") == mid)]
+    seq = (max(int(r.get("seq", 0)) for r in rows) + 1) if rows else None
+    return issue(mid, request_text, type, duration_seconds, seq=seq, **kwargs)
+
+
 def renew(order: str, duration_seconds: int, type: str | None = None) -> str:
     """续期：复用台账里的机器码，客户无需再发一次；seq 递增防止旧许可重置计时。"""
     rows = _issue_rows(order)

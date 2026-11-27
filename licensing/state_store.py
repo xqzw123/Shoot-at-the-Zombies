@@ -1,6 +1,6 @@
 """授权状态：文件 + 注册表双副本，密文封装 + 认证校验。
 
-状态目录固定在 %APPDATA%/ShootAtZombies，不在安装目录里，
+状态目录固定在 %APPDATA%/jiangshikaipao，不在安装目录里，
 因此覆盖安装/卸载重装都不会丢授权。
 
 关于安全性：纯离线、客户端持有全部逻辑时，本地状态无法做到密码学绝对可靠。
@@ -35,11 +35,12 @@ except ImportError:  # 干净 checkout 尚未执行 init-state-secret
     _state_secret_module = None
 
 STATE_FILENAME = "state.json"
-REG_PATH = r"Software\ShootAtZombies\License"
+REG_PATH = r"Software\jiangshikaipao\License"
+_OLD_REG_PATH = r"Software\ShootAtZombies\License"
 REG_VALUE = "mirror"
 _MAX_INT = 2 ** 63 - 1
 _INT_STATE_FIELDS = ("max_seq", "activated_at", "last_seen",
-                     "used_seconds", "revoked_at", "high_water")
+                     "used_seconds", "bonus_seconds", "revoked_at", "high_water")
 
 _IO_LOCK = threading.RLock()
 _TMP_CLEANED = False
@@ -109,8 +110,17 @@ def app_dir() -> str:
     if _APP_DIR_OVERRIDE:
         base = _APP_DIR_OVERRIDE
     else:
-        base = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"),
-                            "ShootAtZombies")
+        root = os.environ.get("APPDATA") or os.path.expanduser("~")
+        base = os.path.join(root, "jiangshikaipao")
+        old = os.path.join(root, "ShootAtZombies")
+        # 旧目录只搬一次。授权状态不在安装目录里，改名后要还能读到。
+        if not os.path.exists(base) and os.path.isdir(old):
+            try:
+                os.rename(old, base)
+            except OSError:
+                base = old
+        os.makedirs(base, exist_ok=True)
+        return base
     os.makedirs(base, exist_ok=True)
     return base
 
@@ -201,6 +211,7 @@ def merge_states(states: list[dict | None]) -> dict | None:
             merged["challenge"] = other["challenge"]
     merged["token"] = best.get("token") or merged.get("token", "")
     merged["order"] = best.get("order") or merged.get("order", "")
+    merged["bonus_seconds"] = as_int(best.get("bonus_seconds", 0))
     return merged
 
 
@@ -267,14 +278,36 @@ def _write_registry_blob(blob: str) -> None:
         _LAST_REGISTRY_ERROR = str(exc)
 
 
+def _query_registry_raw(path: str):
+    import winreg
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, path, 0, winreg.KEY_READ) as key:
+        return winreg.QueryValueEx(key, REG_VALUE)[0]
+
+
 def _read_registry() -> dict | None:
     if not _REGISTRY_ENABLED or sys.platform != "win32":
         return None
     try:
         import winreg
-        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, REG_PATH, 0,
-                            winreg.KEY_READ) as key:
-            raw = winreg.QueryValueEx(key, REG_VALUE)[0]
+        try:
+            raw = _query_registry_raw(REG_PATH)
+        except OSError:
+            raw = None
+        if raw is None:
+            try:
+                raw = _query_registry_raw(_OLD_REG_PATH)
+            except OSError:
+                raw = None
+            if raw is not None:
+                # 新键写成功后再删旧键，避免搬走失败时把唯一副本删掉。
+                _write_registry_blob(json.loads(raw).get("sealed", ""))
+                if _LAST_REGISTRY_ERROR is None:
+                    try:
+                        winreg.DeleteKey(winreg.HKEY_CURRENT_USER, _OLD_REG_PATH)
+                    except OSError:
+                        pass
+        if not raw:
+            return None
         return _unseal(json.loads(raw).get("sealed", ""))
     except Exception:
         return None
@@ -294,7 +327,7 @@ def save_state(state: dict) -> None:
 
 
 _DIVERGE_FIELDS = ("order", "max_seq", "activated_at", "last_seen",
-                   "used_seconds", "revoked", "revoked_at", "token", "challenge",
+                   "used_seconds", "bonus_seconds", "revoked", "revoked_at", "token", "challenge",
                    "high_water")
 
 

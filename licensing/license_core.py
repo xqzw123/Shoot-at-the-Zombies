@@ -152,6 +152,40 @@ def _high_water(state: dict | None) -> int:
     return state_store.as_int(state.get("high_water", 0))
 
 
+def _bonus_seconds(state: dict | None) -> int:
+    if not state:
+        return 0
+    return max(0, state_store.as_int(state.get("bonus_seconds", 0)))
+
+
+def _effective_duration(payload: dict, state: dict | None) -> int:
+    """限时授权有效时长 = 当前码 duration + 叠加上的剩余 bonus。"""
+    base = int(payload.get("duration_seconds") or 0)
+    return max(0, base + _bonus_seconds(state))
+
+
+def _remaining_seconds(state: dict, now: int) -> int:
+    """当前仍有效许可的剩余秒数；耗尽/非限时/无效则 0。"""
+    if not state or state.get("revoked"):
+        return 0
+    raw = state.get("token") or ""
+    try:
+        ok, payload, _ = rsa_sign.verify_token(raw, public_key())
+    except Exception:
+        return 0
+    if not ok or not isinstance(payload, dict) or payload.get("type") != "timed":
+        return 0
+    activated_at = state_store.as_int(state.get("activated_at", 0))
+    duration = _effective_duration(payload, state)
+    if activated_at <= 0 or duration <= 0:
+        return 0
+    effective_now = max(now, _high_water(state))
+    used = state_store.as_int(state.get("used_seconds", 0))
+    calendar_left = activated_at + duration - effective_now
+    usage_left = duration - used
+    return max(0, min(calendar_left, usage_left))
+
+
 def validate(token: str, state: dict | None = None,
              now: int | None = None) -> tuple[bool, dict | None, str]:
     """纯校验，不写状态。返回 (通过, payload, 原因)。"""
@@ -213,7 +247,7 @@ def validate(token: str, state: dict | None = None,
         activated_at = now
 
     if payload["type"] == "timed":
-        duration = int(payload["duration_seconds"])
+        duration = _effective_duration(payload, state)
         if effective_now > activated_at + duration:
             return False, None, "许可已到期"
         # 冻结系统时钟会让日历时间停住；心跳用 time.monotonic() 累计真实
@@ -232,7 +266,7 @@ def validate(token: str, state: dict | None = None,
     return True, payload, "OK"
 
 
-def _new_state(payload: dict, token: str, now: int) -> dict:
+def _new_state(payload: dict, token: str, now: int, bonus_seconds: int = 0) -> dict:
     return {
         "v": 1,
         "order": payload["order"],
@@ -241,6 +275,7 @@ def _new_state(payload: dict, token: str, now: int) -> dict:
         "last_seen": now,
         "high_water": now,
         "used_seconds": 0,
+        "bonus_seconds": max(0, int(bonus_seconds)),
         "revoked": False,
         "revoked_at": 0,
         "challenge": "",
@@ -249,33 +284,72 @@ def _new_state(payload: dict, token: str, now: int) -> dict:
 
 
 def activate(token: str, now: int | None = None) -> tuple[bool, dict | None, str]:
-    """校验并写入状态。新 seq 的许可会重新起算激活时间（续期）。
+    """校验并写入状态。
 
-    ``now`` 显式传入表示自动化/冒烟注入的可信时间；真实客户端首次激活
-    不传，此时必须先取得 NTP 共识，否则拒绝（防转发许可被重新洗成新激活）。
+    限时客户机：
+    - 同一激活码重复导入：拒绝（防止同一码反复叠加）。
+    - 仍有效时导入不同新码：剩余时长 + 新码时长（写入 bonus_seconds）。
+    - 已到期或已撤销后导入新码：仅按新码时长重新计时。
+    - 更低 seq：仍拒绝（防回放旧码）。
+
+    ``now`` 可注入计时；真实客户机首次激活仍要求 NTP 可信时间。
     """
     if now is None:
         if state_store.load_state() is None and not clock.activation_time_is_trusted():
-            return False, None, ("首次激活必须联网且系统时间需与网络时间一致，"
-                                 "请校准时间或联网后重试")
+            return False, None, ("首次激活需要可信网络时间与本地时间一致，"
+                                 "请校准时钟后重试。")
         now = clock.trusted_now()
 
     outcome = {}
 
     def _apply(state):
-        ok, payload, reason = validate(token, state=state, now=now)
+        pub = public_key()
+        ok_pre, payload_pre, reason_pre = rsa_sign.verify_token(token, pub)
+        if not ok_pre or not isinstance(payload_pre, dict):
+            outcome.update(ok=False, payload=None, reason=reason_pre)
+            return None
+
+        validate_state = state
+        rebind = False
+        stack_bonus = 0
+        if state:
+            if token == (state.get("token") or ""):
+                outcome.update(
+                    ok=False,
+                    payload=None,
+                    reason="该激活码已导入，请勿重复使用",
+                )
+                return None
+            max_seq = state_store.as_int(state.get("max_seq", 0))
+            seq = int(payload_pre.get("seq", 0))
+            if max_seq > seq:
+                outcome.update(ok=False, payload=None,
+                               reason="更旧版本已作废，请导入最新签发的激活码")
+                return None
+            newer = seq > max_seq
+            revoked = bool(state.get("revoked"))
+            remaining = 0 if revoked else _remaining_seconds(state, now)
+            if remaining > 0 and payload_pre.get("type") == "timed":
+                stack_bonus = remaining
+            # 不同 token（含更高 seq 续期）一律按新码校验并重绑
+            validate_state = {}
+            rebind = True  # {} = 无本地状态；None 会再 load_state
+
+        ok, payload, reason = validate(token, state=validate_state, now=now)
         outcome.update(ok=ok, payload=payload, reason=reason)
         if not ok:
             return None
         if state is None:
-            return _new_state(payload, token, now)
+            return _new_state(payload, token, now, bonus_seconds=0)
         new_state = dict(state)
         max_seq = state_store.as_int(state.get("max_seq", 0))
         newer = int(payload["seq"]) > max_seq
         new_state["max_seq"] = max(max_seq, int(payload["seq"]))
-        if newer:
+        if newer or rebind:
             new_state["activated_at"] = now
             new_state["used_seconds"] = 0
+            new_state["bonus_seconds"] = (
+                stack_bonus if payload.get("type") == "timed" else 0)
             new_state["revoked"] = False
             new_state["revoked_at"] = 0
             new_state["challenge"] = ""
@@ -288,6 +362,9 @@ def activate(token: str, now: int | None = None) -> tuple[bool, dict | None, str
 
     state_store.update_state(_apply)
     return outcome["ok"], outcome["payload"], outcome["reason"]
+
+
+
 
 
 def apply_revocation(token: str, now: int | None = None) -> tuple[bool, dict | None, str]:
@@ -309,8 +386,11 @@ def apply_revocation(token: str, now: int | None = None) -> tuple[bool, dict | N
     outcome = {}
 
     def _apply(state):
-        if not state or state.get("order") != payload["target_order"]:
-            outcome.update(ok=False, why="本机没有对应订单的许可，撤销令不适用")
+        target = (payload.get("target_order") or "").strip()
+        machine = fingerprint.machine_code()
+        # 取消授权码对的是机器码。旧码仍可能把订单号写在 target_order 里。
+        if not state or target not in (state.get("order"), machine):
+            outcome.update(ok=False, why="本机没有对应的许可，取消授权码不适用")
             return None
         state = dict(state)
         changed = False
@@ -376,7 +456,7 @@ def check_license(strict_time: bool = False) -> tuple[bool, str]:
 
     ``strict_time=True`` 供 launcher 启动入口使用：``timed`` 许可必须本轮
     拿到「NTP 共识 + 本地时钟方向一致」的可信时间，否则拒绝启动。看门狗
-    每 60 秒的复查传 False，靠单调 high_water 保证期间回拨也解不开到期。
+    每 10 分钟的复查传 False，靠单调 high_water 保证期间回拨也解不开到期。
 
     高水位只在交叉校验通过时写：NTP 全断且本地时钟被调快 40 天时，
     绝不能把污染值持久化，否则诚实 NTP 恢复后客户会被永久锁死。
@@ -431,6 +511,33 @@ def check_license(strict_time: bool = False) -> tuple[bool, str]:
 
     state_store.update_state(_check)
     return outcome["result"]
+
+
+def expiry_text() -> str:
+    """界面用的授权截止时间。本地时区，失败时返回短句，不抛异常。"""
+    state = state_store.load_state()
+    if not state:
+        return "未授权"
+    if state.get("revoked"):
+        return "已作废"
+    token = state.get("token") or ""
+    try:
+        ok, payload, _ = rsa_sign.verify_token(token, public_key())
+    except Exception:
+        return "授权无效"
+    if not ok or not isinstance(payload, dict):
+        return "授权无效"
+    if payload.get("type") == "perpetual":
+        return "永久授权"
+    try:
+        activated = state_store.as_int(state.get("activated_at", 0))
+        duration = _effective_duration(payload, state)
+    except (TypeError, ValueError):
+        return "授权无效"
+    if activated <= 0 or duration <= 0:
+        return "授权无效"
+    deadline = time.strftime("%Y-%m-%d %H:%M", time.localtime(activated + duration))
+    return "到期 %s" % deadline
 
 
 def license_summary() -> dict | None:

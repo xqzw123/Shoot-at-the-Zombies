@@ -226,6 +226,7 @@ class TestReleaseGuardDepth(LicensingTestCase):
         self.assertNotIn("revocations\\*", content)
         self.assertIn("[InstallDelete]", content)
         self.assertIn('Name: "{app}\\_internal"', content)
+        self.assertIn('"{userdesktop}\\{#MyAppName}"', content)
 
     def test_preflight_prints_anchor_vcs_warning(self):
         """行为断言：preflight 必须把锚的 VCS 警告打印出来。"""

@@ -53,16 +53,13 @@ def show_activation_dialog(parent: tk.Misc | None, reason: str | None = None) ->
 
     summary = license_core.license_summary()
     if summary:
-        ttk.Label(dialog, text="已记录授权：%s（seq=%s）%s" % (
-            summary["order"], summary["max_seq"],
-            " [已作废]" if summary["revoked"] else "")).pack(anchor="w", **pad)
+        when = "已作废" if summary["revoked"] else license_core.expiry_text()
+        ttk.Label(dialog, text="已记录授权：%s" % when).pack(anchor="w", **pad)
 
     machine = fingerprint.machine_code()
     request_text = license_core.build_request()
 
-    # 激活请求里已含机器码（mid 字段），签发器只吃请求；机器码仅留作对账核对，
-    # 不再单独提供复制按钮，避免客户误以为要发两段内容。
-    ttk.Label(dialog, text="机器码（供核对，无需发送）",
+    ttk.Label(dialog, text="本机机器码（对照用；请复制下方激活请求）",
               font=("TkDefaultFont", 10, "bold")).pack(anchor="w", **pad)
     row = ttk.Frame(dialog)
     row.pack(fill="x", **pad)
@@ -124,7 +121,6 @@ def show_activation_dialog(parent: tk.Misc | None, reason: str | None = None) ->
         win.title("撤销回执 - 请截图或录屏发给作者办理退款")
         win.geometry("520x320")
         lines = [
-            "订单号：%s" % receipt["order"],
             "机器码：%s" % receipt["machine_code"],
             "停用时间：%s" % receipt["revoked_at_utc"],
             "Unix 秒：%d" % receipt["revoked_at"],
@@ -228,3 +224,176 @@ def show_activation_dialog(parent: tk.Misc | None, reason: str | None = None) ->
     if own_root:
         parent.destroy()
     return result["ok"]
+
+
+def _read_token_file(title: str) -> str | None:
+    path = filedialog.askopenfilename(
+        title=title, filetypes=[("激活文件", "*.lic;*.txt"), ("全部", "*.*")])
+    if not path:
+        return None
+    try:
+        with open(path, "r", encoding="utf-8-sig") as fh:
+            return fh.read().lstrip("\ufeff").strip()
+    except (OSError, UnicodeError) as exc:
+        messagebox.showerror("导入失败", "文件读取失败（请用 UTF-8 文本）：%s" % exc)
+        return None
+
+
+def show_license_import_dialog(parent: tk.Misc) -> bool:
+    """粘贴激活码，或直接导入激活文件。不打开首次激活那一整页。"""
+    dialog = tk.Toplevel(parent)
+    dialog.title("导入激活码")
+    dialog.geometry("560x280")
+    result = {"ok": False}
+    pad = {"padx": 10, "pady": 5}
+    ttk.Label(dialog, text="粘贴激活码，或导入激活文件").pack(anchor="w", **pad)
+    token_box = scrolledtext.ScrolledText(dialog, height=8)
+    token_box.pack(fill="both", expand=True, **pad)
+    status = tk.StringVar(value="")
+    ttk.Label(dialog, textvariable=status, wraplength=520).pack(anchor="w", **pad)
+
+    def close_dialog():
+        try:
+            dialog.grab_release()
+        except tk.TclError:
+            pass
+        dialog.destroy()
+
+    def apply_token(token: str):
+        token = token.strip().lstrip("\ufeff")
+        if not token:
+            status.set("请先粘贴激活码，或导入激活文件")
+            return
+        status.set("正在校验激活码，请稍候…")
+        try:
+            dialog.update_idletasks()
+            ok, _payload, why = license_core.activate(token)
+        except Exception as exc:
+            status.set("导入失败：%s" % exc)
+            return
+        if ok:
+            result["ok"] = True
+            close_dialog()
+        else:
+            status.set("导入失败：%s" % why)
+
+    def import_file():
+        text = _read_token_file("选择激活文件")
+        if not text:
+            return
+        token_box.delete("1.0", "end")
+        token_box.insert("1.0", text)
+        apply_token(text)
+
+    actions = ttk.Frame(dialog)
+    actions.pack(fill="x", **pad)
+    ttk.Button(actions, text="导入粘贴内容",
+               command=lambda: apply_token(token_box.get("1.0", "end"))).pack(side="left", padx=4)
+    ttk.Button(actions, text="导入激活文件", command=import_file).pack(side="left", padx=4)
+    ttk.Button(actions, text="关闭", command=close_dialog).pack(side="right", padx=4)
+    dialog.protocol("WM_DELETE_WINDOW", close_dialog)
+    dialog.grab_set()
+    dialog.lift()
+    parent.wait_window(dialog)
+    return result["ok"]
+
+
+def show_revocation_dialog(parent: tk.Misc | None, on_disabled=None) -> None:
+    """激活之后仍可粘贴退款码。回执关闭后调用 on_disabled（用来退出主程序）。"""
+    own_root = False
+    if parent is None:
+        parent = tk.Tk()
+        parent.withdraw()
+        own_root = True
+
+    dialog = tk.Toplevel(parent)
+    dialog.title("导入退款码")
+    dialog.geometry("560x320")
+    pad = {"padx": 10, "pady": 5}
+    try:
+        hint = license_core.expiry_text()
+    except Exception:
+        hint = ""
+    if hint:
+        ttk.Label(dialog, text="当前授权：%s" % hint).pack(anchor="w", **pad)
+    ttk.Label(dialog, text="粘贴退款码，或导入退款文件").pack(anchor="w", **pad)
+    token_box = scrolledtext.ScrolledText(dialog, height=8)
+    token_box.pack(fill="both", expand=True, **pad)
+    status = tk.StringVar(value="")
+    ttk.Label(dialog, textvariable=status, wraplength=520).pack(anchor="w", **pad)
+
+    def close_dialog():
+        try:
+            dialog.grab_release()
+        except tk.TclError:
+            pass
+        dialog.destroy()
+
+    def show_receipt(receipt: dict):
+        win = tk.Toplevel(dialog)
+        win.title("撤销回执 - 请截图或录屏发给作者办理退款")
+        win.geometry("520x320")
+        lines = [
+            "机器码：%s" % receipt["machine_code"],
+            "停用时间：%s" % receipt["revoked_at_utc"],
+            "Unix 秒：%d" % receipt["revoked_at"],
+            "回执码：%s" % receipt["code"],
+            "原因：%s" % receipt["reason"],
+            "",
+            "请把以上信息截图或录屏发给作者；作者会用签发工具复算回执码核验。",
+        ]
+        text = scrolledtext.ScrolledText(win)
+        text.pack(fill="both", expand=True, padx=10, pady=10)
+        text.insert("1.0", "\n".join(lines))
+        text.configure(state="disabled")
+        buttons = ttk.Frame(win)
+        buttons.pack(pady=6)
+        ttk.Button(buttons, text="复制回执",
+                   command=lambda: _copy(win, "\n".join(lines))).pack(side="left", padx=4)
+
+        def close_receipt():
+            try:
+                win.grab_release()
+            except tk.TclError:
+                pass
+            win.destroy()
+            close_dialog()
+            if on_disabled is not None:
+                parent.after(1, on_disabled)
+
+        ttk.Button(buttons, text="关闭", command=close_receipt).pack(side="left", padx=4)
+        win.protocol("WM_DELETE_WINDOW", close_receipt)
+        try:
+            dialog.grab_release()
+        except tk.TclError:
+            pass
+        win.grab_set()
+        dialog.wait_window(win)
+
+    def apply_token(token: str):
+        token = token.strip().lstrip("\ufeff")
+        if not token:
+            status.set("请先粘贴退款码，或导入退款文件")
+            return
+        _import_revocation(token, status.set, show_receipt)
+
+    def import_file():
+        text = _read_token_file("选择退款文件")
+        if not text:
+            return
+        token_box.delete("1.0", "end")
+        token_box.insert("1.0", text)
+        apply_token(text)
+
+    actions = ttk.Frame(dialog)
+    actions.pack(fill="x", **pad)
+    ttk.Button(actions, text="导入粘贴内容",
+               command=lambda: apply_token(token_box.get("1.0", "end"))).pack(side="left", padx=4)
+    ttk.Button(actions, text="导入退款文件", command=import_file).pack(side="left", padx=4)
+    ttk.Button(actions, text="关闭", command=close_dialog).pack(side="right", padx=4)
+    dialog.protocol("WM_DELETE_WINDOW", close_dialog)
+    dialog.grab_set()
+    dialog.lift()
+    parent.wait_window(dialog)
+    if own_root:
+        parent.destroy()

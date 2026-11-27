@@ -110,7 +110,7 @@ def components() -> list[str]:
     if _TEST_COMPONENTS is not None:
         return list(_TEST_COMPONENTS)
     if _COMPONENTS_CACHE is None:
-        # _bios_uuid() 会起 PowerShell（timeout=4）；看门狗每 60 秒调用一次，
+        # _bios_uuid() 会起 PowerShell（timeout=4）；看门狗每 10 分钟调用一次，
         # 不缓存的话最坏每次校验都卡 4 秒。
         result = []
         for name, value in _raw_components():

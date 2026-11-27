@@ -18,7 +18,7 @@ import sys
 import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-APP_NAME = "ShootAtZombies"
+APP_NAME = "jiangshikaipao"
 OUT_DIR = os.path.join(ROOT, "dist", APP_NAME)
 STATE_SECRET_MODULE = os.path.join(ROOT, "licensing", "state_secret.py")
 STATE_SECRET_BACKUP = os.path.join(ROOT, "licensing", "keys", "state_secret.txt")
@@ -58,7 +58,7 @@ _OCR_DATA_SUFFIXES = (".onnx", ".yaml")
 _OCR_DYNAMIC_MODULES = ("ch_ppocr_v3_det", "ch_ppocr_v3_rec", "ch_ppocr_v2_cls")
 _ALWAYS_SUSPICIOUS_SUFFIXES = (".lic", ".revoke", ".pem", ".key",
                                ".jsonl", ".csv", ".bak", ".log")
-_ALLOWED_PROJECT_FILES = {"license.txt", "readme.txt"}
+_ALLOWED_PROJECT_FILES = {"license.txt", "readme.txt", "version"}
 
 # 发布包瘦身：以下二进制由 PyInstaller hook 自动收集，但本程序从不使用，
 # 合计约 48 MB。构建后统一剔除；规则用「子目录 + 文件名正则」精确匹配，
@@ -329,10 +329,40 @@ def ocr_dynamic_import_problems() -> list[str]:
     return problems
 
 
+def version_problems() -> list[str]:
+    """VERSION 与 installer.iss 必须一致，避免安装包与 GUI 对不上号。"""
+    problems = []
+    ver_path = os.path.join(ROOT, "VERSION")
+    if not os.path.isfile(ver_path):
+        problems.append("缺少根目录 VERSION（发版单一版本源）")
+        return problems
+    try:
+        sys.path.insert(0, ROOT)
+        from app_version import read_version, _ISS_VERSION  # noqa: WPS433
+        ver = read_version()
+        if not re.match(r"^\d+\.\d+\.\d+$", ver):
+            problems.append("VERSION 须为 x.y.z，当前=%r" % ver)
+        iss = os.path.join(ROOT, "packaging", "installer.iss")
+        text = open(iss, encoding="utf-8").read()
+        m = _ISS_VERSION.search(text)
+        if not m:
+            problems.append("installer.iss 缺少 #define MyAppVersion")
+        elif m.group(2) != ver:
+            problems.append(
+                "installer.iss MyAppVersion=%s 与 VERSION=%s 不一致；"
+                "发版请先 bump 或运行 app_version.sync_installer_iss"
+                % (m.group(2), ver)
+            )
+    except Exception as exc:
+        problems.append("版本一致性检查失败：%s" % exc)
+    return problems
+
+
 def preflight(engine: str, require_tools: bool = True) -> list[str]:
     problems = []
     if not os.path.isdir(os.path.join(ROOT, "templates")):
         problems.append("templates/ 不存在")
+    problems.extend(version_problems())
     problems.extend(ocr_resource_problems())
     problems.extend(ocr_dynamic_import_problems())
     if not os.path.isfile(os.path.join(ROOT, "launcher.py")):
@@ -375,6 +405,8 @@ def pyinstaller_cmd() -> list[str]:
         "--onedir", "--windowed", "--name", APP_NAME,
         # 源路径必须绝对：--specpath 在别处时，PyInstaller 会相对 spec 目录解析相对路径
         "--add-data", os.path.join(ROOT, "templates") + os.pathsep + "templates",
+        # GUI 标题与问题回溯依赖 VERSION；打进包根，frozen 时由 app_version 解析。
+        "--add-data", os.path.join(ROOT, "VERSION") + os.pathsep + ".",
     ]
     # rapidocr-onnxruntime 的 config.yaml 与 .onnx 模型是数据文件，PyInstaller
     # 静态分析不会自动收集；缺了它们客户机首次调用 RapidOCR() 直接抛 FileExistsError。
@@ -395,6 +427,7 @@ def pyinstaller_cmd() -> list[str]:
             cmd.extend(["--hidden-import", mod])
     cmd.extend([
         "--hidden-import", "win32timezone",
+        "--hidden-import", "app_version",
         # 构建期生成的状态密钥模块：显式声明，避免静态分析漏收导致发布包
         # 解不开老客户的 state.json（覆盖安装后被迫重新授权）
         "--hidden-import", "licensing.state_secret",
@@ -437,7 +470,7 @@ def build_nuitka() -> None:
         "--include-module=licensing.state_secret",
         "--output-filename=" + APP_NAME + ".exe",
         # 与 installer.iss 的 Source 对齐
-        "--output-dir=" + os.path.join(ROOT, "dist", "ShootAtZombies"),
+        "--output-dir=" + OUT_DIR,
         "launcher.py",
     ]
     print("执行：", " ".join(cmd))
@@ -455,7 +488,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--engine", choices=["pyinstaller", "nuitka"], default="pyinstaller",
                         help="pyinstaller 为默认且已验证；nuitka 为实验性档位")
     parser.add_argument("--check", action="store_true", help="只做发布前检查")
+    parser.add_argument(
+        "--bump-patch", action="store_true",
+        help="发版前 patch +1：写 VERSION 并同步 installer.iss（仅用户明确发版时用）",
+    )
     args = parser.parse_args(argv)
+
+    if args.bump_patch:
+        sys.path.insert(0, ROOT)
+        from app_version import release_bump_patch
+        new_ver = release_bump_patch()
+        print("已 bump 至 %s（VERSION + installer.iss）" % new_ver)
 
     problems = preflight(args.engine, require_tools=True)
     if problems:

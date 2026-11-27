@@ -68,7 +68,7 @@ class TestOcrDynamicImportPackaging(LicensingTestCase):
         TextDetector / TextRecognizer / TextClassifier。
         """
         br = load_build_release()
-        exe = os.path.join(br.OUT_DIR, "ShootAtZombies.exe")
+        exe = os.path.join(br.OUT_DIR, br.APP_NAME + ".exe")
         if not os.path.isfile(exe):
             self.skipTest("尚未构建")
 

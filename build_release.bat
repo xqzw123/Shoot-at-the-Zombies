@@ -1,7 +1,7 @@
 ﻿@echo off
 chcp 65001 >nul
 REM One-click release build: preflight -> PyInstaller onedir -> smoke test -> Inno Setup installer.
-REM Produces dist\ShootAtZombies\ and dist\installer\ShootAtZombiesSetup.exe
+REM Produces dist\jiangshikaipao\ and dist\installer\jiangshikaipaoSetup.exe
 cd /d "%~dp0"
 echo ============================================
 echo  Release Build  (PyInstaller onedir)
@@ -50,9 +50,10 @@ echo.
 echo ============================================
 echo  BUILD OK
 echo ============================================
-echo  Program:   dist\ShootAtZombies\ShootAtZombies.exe
-echo  Installer: dist\installer\ShootAtZombiesSetup.exe
-echo  Reminder:  bump MyAppVersion in installer.iss before release.
+echo  Program:   dist\jiangshikaipao\jiangshikaipao.exe
+echo  Installer: dist\installer\jiangshikaipaoSetup.exe
+echo  Reminder:  release bump = python packaging/build_release.py --bump-patch --check
+echo             then rebuild; see skills/project-evolve/SKILL.md
 echo             ([WARN] about fingerprint anchor = commit it to git HEAD)
 echo.
 pause

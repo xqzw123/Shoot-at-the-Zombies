@@ -2,7 +2,7 @@
 
 与主程序之间只有三条契约（见 docs/授权与打包方案.md）：
   1. 打包入口用本文件，而不是 game_bot.py；
-  2. frozen 时把工作目录切到 %APPDATA%\\ShootAtZombies，
+  2. frozen 时把工作目录切到 %APPDATA%\\jiangshikaipao，
      解决 config.json 与 screenshots 相对路径写不了；
   3. 以 templates/ 是否真实存在为判据补齐 sys._MEIPASS，保证模板加载。
 
@@ -18,7 +18,8 @@ from licensing import clock, license_core, state_store
 # 时间校准类失败只提示、不累计到强制退出：CMOS 没电 / 系统时间被误设的
 # 付费客户应该能继续用，而不是 3 分钟后被踢出程序。
 _TIME_CALIBRATION_REASONS = ("回拨", "校准", "联网")
-MAX_CALIBRATION_GRACE_TICKS = 10   # 时间校准类失败最多豁免 10 分钟，不能无限豁免
+WATCHDOG_INTERVAL_MS = 10 * 60 * 1000  # 运行中授权复查间隔
+MAX_CALIBRATION_GRACE_TICKS = 1         # 时间校准类失败豁免 1 次（约 10 分钟），不能无限豁免
 
 # OpenCV 在 Windows 上用 cv2.imread 读中文路径会静默返回 None（imread_ 用
 # 窄字符 API 打不开），客户把程序装到中文目录时 115 张模板会全部加载失败。
@@ -69,8 +70,7 @@ def restore_cv2_imread() -> None:
 def _report_startup_error(message: str, show_dialog: bool = True) -> None:
     """公钥自检/资源定位失败时给出可读提示，避免客户只看到进程闪退。"""
     try:
-        base = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"),
-                            "ShootAtZombies")
+        base = state_store.app_dir()
         os.makedirs(base, exist_ok=True)
         with open(os.path.join(base, "startup_error.log"), "a",
                   encoding="utf-8") as fh:
@@ -109,10 +109,8 @@ def _prepare_paths() -> None:
     match = next((base for base in candidates
                   if base and os.path.isdir(os.path.join(base, "templates"))), None)
 
-    appdata = os.environ.get("APPDATA") or os.path.expanduser("~")
-    work_dir = os.path.join(appdata, "ShootAtZombies")
+    work_dir = state_store.app_dir()
     try:
-        os.makedirs(work_dir, exist_ok=True)
         os.chdir(work_dir)
     except OSError as exc:
         message = "无法切换工作目录到 %s：%s" % (work_dir, exc)
@@ -166,9 +164,9 @@ def _verify_release_secrets() -> bool:
 
 
 def _make_watchdog(root, gui):
-    """每 60 秒复查授权；连续 3 次**非时间校准类**失败才退出。
+    """每 10 分钟复查授权；连续 3 次**非时间校准类**失败才退出。
 
-    时间校准类失败只豁免 10 分钟（避免「回拨」类 reason 被无限豁免，
+    时间校准类失败只豁免 1 次（避免「回拨」类 reason 被无限豁免，
     让已到期/被撤销的程序一直跑），且任何异常都不能让看门狗静默死亡。
     ``clock.start_time_refresher()`` 在启动前已同步预热并交给后台线程刷新，
     这里 ``check_license()`` 永远只做内存计算，不会卡住 Tk 主线程。
@@ -200,9 +198,19 @@ def _make_watchdog(root, gui):
             # 只写日志、不弹窗：一次偶发异常不应让授权复查永久停摆
             _report_startup_error("授权复查异常：%r" % (exc,), show_dialog=False)
         if not failures["stopped"]:
-            root.after(60000, _watch)
+            root.after(WATCHDOG_INTERVAL_MS, _watch)
 
     return _watch
+
+
+def _attach_license_controls(root) -> None:
+    """主界面标题上显示到期时间。退款入口在界面按钮上，不再挂菜单栏。"""
+    try:
+        text = license_core.expiry_text()
+    except Exception:
+        text = ""
+    if text:
+        root.title("%s — %s" % (root.title(), text))
 
 
 def main() -> int:
@@ -225,10 +233,11 @@ def main() -> int:
         root.deiconify()
         import game_bot
         gui = game_bot.GameBotGUI(root)
+        _attach_license_controls(root)
 
         # 运行中限时到期或撤销令生效会主动退出，不依赖用户重启，
-        # 且完全不改 game_bot.py。
-        root.after(60000, _make_watchdog(root, gui))
+        # 且完全不改 game_bot.py。每 10 分钟复查，连续 3 次确认到期/作废才退出。
+        root.after(WATCHDOG_INTERVAL_MS, _make_watchdog(root, gui))
         root.mainloop()
     finally:
         # 先停心跳并等写线程收尾，避免退出时与状态写入竞态

@@ -1037,8 +1037,8 @@ class GameBot:
         return False
 
     def find_click_receive(self):
-        """判断能否点击领取按钮"""
-        self.click_template("receive.png")
+        """判断能否点击领取按钮；点到返回 True。"""
+        return self.click_template("receive.png")
 
     def find_click_im(self):
         """判断能否点击环球页面"""
@@ -1165,8 +1165,8 @@ class GameBot:
         return False
 
     def find_click_home_close(self):
-        """判断能否点击关闭按钮"""
-        self.click_first_template(
+        """判断能否点击关闭按钮；点到返回 True。"""
+        return self.click_first_template(
             [
                 "home-close.png",
                 "home-close-1.png",
@@ -1496,7 +1496,8 @@ class GameBot:
 
     def _preferred_skill_slots(self, img, client_centers, scale=None,
                                return_detail=False, roi_half=None, min_tpl_side=60,
-                               use_ocr=None, do_capture=False, use_derivative_name=False):
+                               use_ocr=None, do_capture=False, use_derivative_name=False,
+                               derivative_roi=None):
         """全模式共用：按 优先技能 → 同族偏好衍生 → SKILL_LIST → 左到右 排序。
 
         图标只认大类；OCR 认卡名后，在同一 family_rank 内用衍生偏好细分。
@@ -1505,7 +1506,8 @@ class GameBot:
 
         use_ocr: None=按配置自动；翻牌等待帧传 False，最终决策帧传 True。
         do_capture: 仅最终决策时 True，避免每帧存图。
-        use_derivative_name: 读卡顶标题栏的衍生技能名（3选1 用，4选2 布局不适配）。
+        use_derivative_name: 读卡顶标题栏的衍生技能名（3选1/4选2 均可；ROI 按布局传）。
+        derivative_roi: 可选 (half_w, top, bottom)，4选2 等小卡用更紧的标题栏。
         """
         groups, group_names = [], []
         for templates in self.priority_skills:
@@ -1529,12 +1531,17 @@ class GameBot:
                 if s > score:
                     rank, score, best_name = prio_idx, s, group_names[prio_idx]
 
-            # 3选1 卡顶标题栏是衍生技能名（伤害增幅/轰炸增伤…），优先读它；
-            # 读不到再回退到图标下方的效果描述老逻辑（4选2 等布局仍走老逻辑）。
+            # 卡顶标题栏是衍生技能名（伤害增幅/轰炸增伤…），优先读它；
+            # 读不到再回退到图标下方的效果描述老逻辑。
             card_name = ""
             if need_ocr:
                 if use_derivative_name:
-                    card_name = self._ocr_card_derivative(img, cx, cy)
+                    if derivative_roi:
+                        d_hw, d_top, d_bot = derivative_roi
+                        card_name = self._ocr_card_derivative(
+                            img, cx, cy, half_w=d_hw, top=d_top, bottom=d_bot)
+                    else:
+                        card_name = self._ocr_card_derivative(img, cx, cy)
                 if not card_name:
                     card_name = self._ocr_card_name(img, cx, cy)
             # 兜底：翻牌中途图标未翻开（模板分0→rank999），但标题栏文字已可读，
@@ -1688,8 +1695,10 @@ class GameBot:
         ax, ay = client_anchor
         client_centers = [(ax + dx, ay + dy) for dx, dy in self._card_offsets_4()]
         count = self._abyss_selection_count(img, ax, ay)
+        # 4选2 图标约 0.72× 于 3选1，标题栏 ROI 收紧：half_w=50, top=-95, bottom=-70
         preferred = self._preferred_skill_slots(
-            img, client_centers, use_ocr=self._need_skill_ocr(), do_capture=True
+            img, client_centers, use_ocr=self._need_skill_ocr(), do_capture=True,
+            use_derivative_name=True, derivative_roi=(50, -95, -70),
         )
         print(f"[{tag}选技能] 按钮张数={count}/2 优先顺序={preferred}")
 
@@ -1798,11 +1807,12 @@ class GameBot:
             self._save_skill_debug(img, tag, ax, ay, suffix="unrecognized")
 
         # 最终决策：带 OCR 的衍生排序 + 可选采集截图
+        # use_derivative_name 与 band_roi 解耦：元素 3选1 与环球/主线都读卡顶衍生名
         preferred, detail = self._preferred_skill_slots(
             img, icon_centers, scale=self.SKILL_TPL_SCALE_PICK_ONE,
             return_detail=True, roi_half=roi_half, min_tpl_side=min_tpl_side,
             use_ocr=self._need_skill_ocr(), do_capture=True,
-            use_derivative_name=band_roi,
+            use_derivative_name=True,
         )
         any_hit = [d for d in detail if d[1] < 999]
         slot = preferred[0]
@@ -2138,6 +2148,28 @@ class GameBot:
         time.sleep(0.4)
         return True
 
+    def find_click_element_fail_return(self):
+        """挑战失败页：确认失败文案后再点返回，回到详情页可再点挑战。
+
+        成功结算也有返回按钮，不能无条件点返回——必须先命中「挑战失败」文字。
+        失败页无「下一关」，若不处理会卡在 element_pending_battle 空转。
+        """
+        fail = self.find_template("element-fail-text.png", threshold=0.75)
+        if not fail:
+            return False
+        ret = self.find_template("return.png")
+        if ret:
+            self.click(*ret)
+        elif self.game_window:
+            # 客户区底部中心黄按钮约 y=880-920（窗口约 544x1011）
+            left, top = self.game_window[0], self.game_window[1]
+            self.click(left + 272, top + 900)
+        else:
+            return False
+        time.sleep(0.4)
+        print("[元素] 挑战失败页点返回，准备重开")
+        return True
+
     def find_click_activated_skills(self):
         """关闭每局开局都会弹出的「已激活技能」确认页。
 
@@ -2412,6 +2444,9 @@ class GameBot:
         print("开始自动刷图脚本...")
         print("提示: 按下ESC键可以随时停止脚本")
 
+        # 启动时确保窗口尺寸；找不到则稍后由下方 find_game_window 重试
+        self.resize_game_window()
+
         # timestamp = time.time()
         while self.running:
             # 单步调试：每轮阻塞等待 GUI 点"下一步"，避免自动连跑刷屏。
@@ -2440,6 +2475,14 @@ class GameBot:
             # find_click_return() 会误点到结算页"返回"而退出。故本模式独立处理
             # 导航/选技能/结算，continue 跳过下方所有通用逻辑。
             if self.mode == 5:
+                # 首页巡逻「领取」等弹窗：通用段被本模式 continue 跳过，这里复用同款逻辑。
+                # 仍不调用 find_click_return（成功结算页也有返回，会误退出试炼）。
+                if self.find_click_receive():
+                    print("[元素] 领取首页奖励弹窗")
+                    continue
+                if self.find_click_home_close():
+                    print("[元素] 关闭首页弹窗")
+                    continue
                 # 0) 每局开局都会弹「已激活技能」确认页：点下方文字区关闭。
                 #    点"下一关"后必然出现；不识别就会一直等，直到过渡超时误走首页导航。
                 if self.find_click_activated_skills():
@@ -2458,6 +2501,17 @@ class GameBot:
                     if self.on_battle_count_changed:
                         self.on_battle_count_changed(self.battle_count)
                     print(f"[元素] 结算页点下一关，第 {self.element_count} 轮完成，进入下一局过渡")
+                    continue
+                # 1.5) 挑战失败页：无「下一关」，先确认失败文案再点返回 → 详情页重开。
+                #     不可无条件 find_click_return（成功结算也有返回，会误退出）。
+                if self.find_click_element_fail_return():
+                    self.element_pending_battle = False
+                    self.element_after_next = False
+                    self.element_pending_since = time.time()
+                    self.battle_count += 1
+                    if self.on_battle_count_changed:
+                        self.on_battle_count_changed(self.battle_count)
+                    print(f"[元素] 挑战失败返回，战斗计数={self.battle_count}，准备重开")
                     continue
                 # 2) 选技能界面（战斗中最常见，必须高频响应）
                 if self.find_click_skill_element():
@@ -2866,7 +2920,11 @@ class GameBotGUI:
 
     def __init__(self, root):
         self.root = root
-        self.root.title("游戏机器人操作界面")
+        try:
+            from app_version import window_title
+            self.root.title(window_title())
+        except Exception:
+            self.root.title("向僵尸开炮助手")
         self.root.geometry("760x860")
         self.root.resizable(True, True)
 
@@ -2914,9 +2972,6 @@ class GameBotGUI:
                     # 加载匹配日志开关（默认关闭）
                     match_log_enabled = config.get("match_log_enabled", False)
                     self.match_log_var.set(match_log_enabled)
-                    # 加载单步调试开关（默认关闭）
-                    debug_mode = config.get("debug_mode", False)
-                    self.debug_mode_var.set(debug_mode)
                     # 加载战斗次数
                     max_battle_count = config.get("max_battle_count", 0)
                     self.max_battle_count_var.set(max_battle_count)
@@ -2926,7 +2981,6 @@ class GameBotGUI:
                     recruit_click_interval = config.get("recruit_click_interval", 0.05)
                     self.recruit_interval_var.set(recruit_click_interval)
                     self.exclude_ammo_var.set(config.get("exclude_element_ammo", False))
-                    self.skill_capture_var.set(config.get("skill_capture_enabled", False))
                     # 加载优先技能配置
                     priority_skills = config.get("priority_skills", [])
                     for i, skill_name in enumerate(priority_skills):
@@ -2973,12 +3027,10 @@ class GameBotGUI:
                 "quick_exit": self.quick_exit_var.get(),
                 "background_mode": self.background_mode_var.get(),
                 "match_log_enabled": self.match_log_var.get(),
-                "debug_mode": self.debug_mode_var.get(),
                 "max_battle_count": self.max_battle_count_var.get(),
                 "battle_time": self.battle_time_var.get(),
                 "recruit_click_interval": self.recruit_interval_var.get(),
                 "exclude_element_ammo": self.exclude_ammo_var.get(),
-                "skill_capture_enabled": self.skill_capture_var.get(),
                 "priority_skills": [var.get() for var in self.priority_skill_vars],
                 "priority_derivatives": self._collect_priority_derivatives(),
             }
@@ -3000,6 +3052,11 @@ class GameBotGUI:
             self.root, textvariable=self.game_title_var, width=30
         )
         self.game_title_entry.grid(row=0, column=1, padx=10, pady=5, sticky=tk.W)
+        lic_btns = ttk.Frame(self.root)
+        lic_btns.grid(row=0, column=2, padx=4, pady=5, sticky=tk.E)
+        ttk.Button(lic_btns, text="复制激活请求", command=self._copy_activation_request).pack(side=tk.LEFT, padx=2)
+        ttk.Button(lic_btns, text="导入激活码", command=self._import_license).pack(side=tk.LEFT, padx=2)
+        ttk.Button(lic_btns, text="导入退款码", command=self._open_refund).pack(side=tk.LEFT, padx=2)
 
         # 模式选择
         ttk.Label(self.root, text="模式:").grid(
@@ -3065,30 +3122,13 @@ class GameBotGUI:
         )
         self.match_log_check.grid(row=1, column=0, sticky=tk.W)
 
-        # 单步调试（排查用，默认关闭）：开启后主循环每轮需点"下一步"才执行，避免刷屏
-        self.debug_mode_var = tk.BooleanVar(value=False)
-        self.debug_mode_check = ttk.Checkbutton(
-            run_opts,
-            text="单步调试（点“下一步”才走一步，避免刷屏）",
-            variable=self.debug_mode_var,
-        )
-        self.debug_mode_check.grid(row=2, column=0, sticky=tk.W)
-
         self.exclude_ammo_var = tk.BooleanVar(value=False)
         self.exclude_ammo_check = ttk.Checkbutton(
             run_opts,
             text="排除枪械「元素弹药」",
             variable=self.exclude_ammo_var,
         )
-        self.exclude_ammo_check.grid(row=3, column=0, sticky=tk.W)
-
-        self.skill_capture_var = tk.BooleanVar(value=False)
-        self.skill_capture_check = ttk.Checkbutton(
-            run_opts,
-            text="选技能采集截图(校对OCR)",
-            variable=self.skill_capture_var,
-        )
-        self.skill_capture_check.grid(row=4, column=0, sticky=tk.W)
+        self.exclude_ammo_check.grid(row=2, column=0, sticky=tk.W)
 
         # 默认模式是环球，所以默认显示
         self.on_mode_changed(None)
@@ -3205,16 +3245,6 @@ class GameBotGUI:
             state=tk.DISABLED,
         )
         self.stop_btn.pack(side=tk.LEFT, padx=10)
-
-        # 单步按钮（仅单步调试模式可用）：点一下放行主循环一轮
-        self.step_btn = ttk.Button(
-            button_frame,
-            text="下一步 ▶",
-            command=self.step_once,
-            width=15,
-            state=tk.DISABLED,
-        )
-        self.step_btn.pack(side=tk.LEFT, padx=10)
 
         # 调整窗口大小按钮
         self.resize_btn = ttk.Button(
@@ -3343,7 +3373,6 @@ class GameBotGUI:
             battle_time = self.battle_time_var.get()
             rich_mode = self.rich_mode_var.get()
             quick_exit = self.quick_exit_var.get()
-            debug_mode = self.debug_mode_var.get()
 
             # 获取5个优先技能（将中文名称转换为模板文件名）
             priority_skills = []
@@ -3365,7 +3394,6 @@ class GameBotGUI:
             # 创建GameBot实例
             priority_derivatives = self._collect_priority_derivatives()
             exclude_ammo = self.exclude_ammo_var.get()
-            skill_capture = self.skill_capture_var.get()
             self.bot = GameBot(
                 game_title,
                 battle_time,
@@ -3377,13 +3405,21 @@ class GameBotGUI:
                 quick_exit,
                 self.background_mode_var.get(),
                 self.match_log_var.get(),
-                debug_mode,
+                False,
                 self.recruit_interval_var.get(),
                 priority_derivatives,
                 exclude_ammo,
-                skill_capture,
+                False,
             )
             self.bot.on_battle_count_changed = self._update_battle_count
+            # 正确识别/点击依赖固定客户区尺寸，开始前必须先调整
+            if not self.bot.resize_game_window():
+                messagebox.showerror(
+                    "错误",
+                    "未找到游戏窗口，无法调整大小。\n请先打开游戏窗口后再点开始。",
+                )
+                self.bot = None
+                return
             if self.match_log_var.get():
                 print("[匹配日志] 已开启：模板匹配分数将记录到 bot.log")
             print(
@@ -3392,20 +3428,12 @@ class GameBotGUI:
             )
             if exclude_ammo:
                 print("[选技能] 已开启：排除枪械「元素弹药」")
-            if skill_capture:
-                print("[选技能] 已开启：选技能采集截图")
             for fam, names in priority_derivatives.items():
                 prefs = [n for n in names if n]
                 if prefs:
                     print(f"[选技能] {fam} 偏好衍生: {', '.join(prefs)}")
 
-            # 更新状态
-            if debug_mode:
-                self.status_var.set("单步调试：点「下一步」开始第 1 步")
-                self.step_btn.config(state=tk.NORMAL)
-            else:
-                self.status_var.set("运行中...")
-                self.step_btn.config(state=tk.DISABLED)
+            self.status_var.set("运行中...")
             self.battle_count_var.set("战斗次数: 0")
             self.start_btn.config(state=tk.DISABLED)
             self.stop_btn.config(state=tk.NORMAL)
@@ -3418,9 +3446,7 @@ class GameBotGUI:
             self.quick_exit_check.config(state=tk.DISABLED)
             self.background_mode_check.config(state=tk.DISABLED)
             self.match_log_check.config(state=tk.DISABLED)
-            self.debug_mode_check.config(state=tk.DISABLED)
             self.exclude_ammo_check.config(state=tk.DISABLED)
-            self.skill_capture_check.config(state=tk.DISABLED)
             self.max_battle_count_spinbox.config(state=tk.DISABLED)
             self.battle_time_spinbox.config(state=tk.DISABLED)
             self.recruit_interval_spinbox.config(state=tk.DISABLED)
@@ -3438,15 +3464,6 @@ class GameBotGUI:
         except Exception as e:
             messagebox.showerror("错误", f"启动失败: {str(e)}")
             self.status_var.set("就绪")
-
-    def step_once(self):
-        """单步调试：放行主循环执行一轮，然后重新阻塞等待下一次点击"""
-        bot = self.bot
-        if bot and bot.debug_mode and bot.running:
-            bot.step_event.set()
-            self.status_var.set(
-                f"单步调试：已放行第 {bot.step_count} 步 — 等待下一次点击"
-            )
 
     def run_bot(self):
         """运行游戏机器人主循环"""
@@ -3477,7 +3494,6 @@ class GameBotGUI:
         self.status_var.set("已停止")
         self.start_btn.config(state=tk.NORMAL)
         self.stop_btn.config(state=tk.DISABLED)
-        self.step_btn.config(state=tk.DISABLED)
 
         # 启用所有参数控件
         self.game_title_entry.config(state=tk.NORMAL)
@@ -3487,9 +3503,7 @@ class GameBotGUI:
         self.quick_exit_check.config(state=tk.NORMAL)
         self.background_mode_check.config(state=tk.NORMAL)
         self.match_log_check.config(state=tk.NORMAL)
-        self.debug_mode_check.config(state=tk.NORMAL)
         self.exclude_ammo_check.config(state=tk.NORMAL)
-        self.skill_capture_check.config(state=tk.NORMAL)
         self.max_battle_count_spinbox.config(state=tk.NORMAL)
         self.battle_time_spinbox.config(state=tk.NORMAL)
         self.recruit_interval_spinbox.config(state=tk.NORMAL)
@@ -3512,6 +3526,29 @@ class GameBotGUI:
                 self.status_var.set("未找到游戏窗口，无法调整大小")
         except Exception as e:
             self.status_var.set(f"调整窗口大小失败: {e}")
+
+    def _copy_activation_request(self):
+        """复制完整激活请求（SZREQ），发给软件方签发激活码。"""
+        from licensing import license_core
+        req = license_core.build_request()
+        self.root.clipboard_clear()
+        self.root.clipboard_append(req)
+        self.status_var.set("激活请求已复制（长度 %d）" % len(req))
+
+    def _import_license(self):
+        """已激活后仍可粘贴一张新的激活码，按新码的时长重新起算。"""
+        from licensing import activation_ui, license_core
+        if not activation_ui.show_license_import_dialog(self.root):
+            return
+        text = license_core.expiry_text()
+        base = self.root.title().split(" — ")[0]
+        self.root.title("%s — %s" % (base, text))
+        self.status_var.set("已导入新激活码：%s" % text)
+
+    def _open_refund(self):
+        """激活之后导入退款码；回执关掉后退出，避免停用后还能继续用。"""
+        from licensing import activation_ui
+        activation_ui.show_revocation_dialog(self.root, on_disabled=self.quit_app)
 
     def quit_app(self):
         """退出应用程序"""

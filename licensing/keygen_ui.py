@@ -8,7 +8,7 @@ import os
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog, scrolledtext
 
-from licensing import keygen, rsa_sign, clock
+from licensing import keygen, rsa_sign, clock, fingerprint
 
 
 class KeygenWindow:
@@ -23,14 +23,14 @@ class KeygenWindow:
         top = ttk.Frame(self.root)
         top.pack(fill="x", **pad)
 
-        ttk.Label(top, text="订单号").grid(row=0, column=0, sticky="w")
-        self.order_var = tk.StringVar(value="A001")
-        ttk.Entry(top, textvariable=self.order_var, width=20).grid(row=0, column=1, sticky="w")
-
-        ttk.Label(top, text="类型").grid(row=0, column=2, sticky="w")
+        ttk.Label(top, text="类型").grid(row=0, column=0, sticky="w")
         self.type_var = tk.StringVar(value="限时")
         ttk.Combobox(top, textvariable=self.type_var, width=10, state="readonly",
-                     values=["永久", "限时"]).grid(row=0, column=3, sticky="w")
+                     values=["永久", "限时"]).grid(row=0, column=1, sticky="w")
+
+        ttk.Label(top, text="机器码").grid(row=0, column=2, sticky="w")
+        self.machine_var = tk.StringVar()
+        ttk.Entry(top, textvariable=self.machine_var, width=24).grid(row=0, column=3, sticky="w")
 
         ttk.Label(top, text="时长").grid(row=1, column=0, sticky="w")
         self.duration_var = tk.StringVar(value="7")
@@ -39,16 +39,15 @@ class KeygenWindow:
         ttk.Combobox(top, textvariable=self.unit_var, width=6, state="readonly",
                      values=["天", "小时"]).grid(row=1, column=2, sticky="w")
 
-        ttk.Label(self.root, text="激活请求（客户发来的机器码文本）").pack(anchor="w", **pad)
+        ttk.Label(self.root, text="激活请求（客户发来的那一段；生成激活码用）").pack(anchor="w", **pad)
         self.request_text = scrolledtext.ScrolledText(self.root, height=6)
         self.request_text.pack(fill="both", **pad)
 
         buttons = ttk.Frame(self.root)
         buttons.pack(fill="x", **pad)
         ttk.Button(buttons, text="导入请求文件", command=self.load_request).pack(side="left", padx=4)
-        ttk.Button(buttons, text="生成许可证", command=self.do_sign).pack(side="left", padx=4)
-        ttk.Button(buttons, text="续期", command=self.do_renew).pack(side="left", padx=4)
-        ttk.Button(buttons, text="生成撤销令", command=self.do_revoke).pack(side="left", padx=4)
+        ttk.Button(buttons, text="生成激活码", command=self.do_sign).pack(side="left", padx=4)
+        ttk.Button(buttons, text="生成取消授权码", command=self.do_revoke).pack(side="left", padx=4)
         ttk.Button(buttons, text="验证退款回执", command=self.do_verify).pack(side="left", padx=4)
 
         ttk.Label(self.root, text="输出（可直接复制发给客户）").pack(anchor="w", **pad)
@@ -101,34 +100,29 @@ class KeygenWindow:
         try:
             typ = "perpetual" if self.type_var.get() == "永久" else "timed"
             duration = 0 if typ == "perpetual" else self._duration()
-            token = keygen.issue(self.order_var.get().strip(), self._request(),
-                                 typ, duration)
+            request_text = self._request()
+            token = keygen.issue_for_request(request_text, typ, duration)
+            mid = fingerprint.parse_request(request_text)["mid"]
+            self.machine_var.set(mid)
             self._set_output(rsa_sign.split_lines(token))
-            self.status.set("已签发 %s，台账已记录" % self.order_var.get().strip())
+            self.status.set("已生成激活码（机器码 %s）" % mid)
             self.show_ledger()
         except Exception as exc:
             messagebox.showerror("签发失败", str(exc))
-
-    def do_renew(self):
-        try:
-            token = keygen.renew(self.order_var.get().strip(), self._duration())
-            self._set_output(rsa_sign.split_lines(token))
-            self.status.set("已续期，seq 递增")
-            self.show_ledger()
-        except Exception as exc:
-            messagebox.showerror("续期失败", str(exc))
 
     def do_revoke(self):
         # keygen.make_revocation() 现在要求可信时间（与客户端首次激活对称），
         # NTP 不可达会抛 RuntimeError；GUI 无控制台，必须弹窗说明而不是静默。
         try:
-            token, _ = keygen.make_revocation(
-                self.order_var.get().strip(), "用户退款")
+            mid = self.machine_var.get().strip()
+            if not mid:
+                mid = fingerprint.parse_request(self._request())["mid"]
+            token, _ = keygen.make_revocation(mid, "取消授权")
             self._set_output(rsa_sign.split_lines(token))
-            self.status.set("撤销令已生成；发给客户导入后，请索取回执截图/视频")
+            self.status.set("取消授权码已生成（机器码 %s）" % mid)
             self.show_ledger()
         except Exception as exc:
-            messagebox.showerror("撤销令生成失败", str(exc))
+            messagebox.showerror("取消授权码生成失败", str(exc))
 
     def do_verify(self):
         dialog = tk.Toplevel(self.root)
@@ -145,7 +139,7 @@ class KeygenWindow:
 
         def run():
             try:
-                ok, reason = keygen.verify_receipt(self.order_var.get().strip(),
+                ok, reason = keygen.verify_receipt(self.machine_var.get().strip(),
                                                    code.get().strip(), int(at.get().strip()))
                 result.set(("有效 - " if ok else "无效 - ") + reason)
             except Exception as exc:
@@ -177,7 +171,7 @@ class KeygenWindow:
         if not text:
             return
         path = filedialog.asksaveasfilename(defaultextension=".lic",
-                                            initialfile="%s.lic" % self.order_var.get().strip(),
+                                            initialfile="license.lic",
                                             filetypes=[("许可证", "*.lic")])
         if path:
             try:

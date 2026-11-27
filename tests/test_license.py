@@ -21,6 +21,18 @@ class TestValidate(LicensingTestCase):
         ok, _, reason = license_core.validate(token)
         self.assertTrue(ok, reason)
 
+    def test_expiry_text_is_activation_plus_duration(self):
+        import time
+        token = self.issue(typ="timed", days=7)
+        self.assertTrue(self.activate(token)[0])
+        expected = time.strftime("%Y-%m-%d %H:%M", time.localtime(BASE_TIME + 7 * 86400))
+        self.assertEqual(license_core.expiry_text(), "到期 %s" % expected)
+
+    def test_expiry_text_perpetual(self):
+        token = self.issue(typ="perpetual", days=0)
+        self.assertTrue(self.activate(token)[0])
+        self.assertEqual(license_core.expiry_text(), "永久授权")
+
     def test_timed_ok_then_expired(self):
         token = self.issue(typ="timed", days=7)
         self.assertTrue(self.activate(token)[0])
@@ -105,13 +117,15 @@ class TestActivation(LicensingTestCase):
         self.assertFalse(state["revoked"])
 
     def test_old_seq_rejected(self):
-        first = self.issue()
+        first = self.issue(typ="timed", days=1)
         self.assertTrue(self.activate(first)[0])
+        self.advance(2 * 86400)  # 到期后才允许续期
         newer = keygen.renew("A001", 30 * 86400)
         self.assertTrue(self.activate(newer)[0])
         ok, _, reason = self.activate(first)
         self.assertFalse(ok)
-        self.assertIn("过旧", reason)
+        self.assertTrue(any(k in reason for k in ("过期", "作废", "旧")), reason)
+
 
     def test_clock_rollback_rejected(self):
         token = self.issue()
@@ -133,14 +147,42 @@ class TestActivation(LicensingTestCase):
         self.assertFalse(ok)
         self.assertIn("激活", reason)
 
-    def test_renew_resets_activated_at(self):
+    def test_stack_adds_remaining_seconds(self):
+        """有效期内导入新码：剩余 + 新时长。"""
+        first = self.issue(typ="timed", days=7)
+        self.assertTrue(self.activate(first)[0])
+        self.advance(6 * 86400)  # 还剩 1 天
+        newer = keygen.renew("A001", 7 * 86400)
+        ok, _, reason = self.activate(newer)
+        self.assertTrue(ok, reason)
+        state = state_store.load_state()
+        self.assertEqual(state["activated_at"], BASE_TIME + 6 * 86400)
+        self.assertEqual(state["bonus_seconds"], 1 * 86400)
+        # 剩余 1 天 + 新 7 天 = 8 天
+        self.advance(8 * 86400 - 1)
+        self.assertTrue(license_core.check_license()[0])
+        self.advance(2)
+        self.assertFalse(license_core.check_license()[0])
+
+    def test_same_token_rejected_on_reimport(self):
         token = self.issue(typ="timed", days=7)
         self.assertTrue(self.activate(token)[0])
-        self.advance(3 * 86400)
+        ok, _, reason = self.activate(token)
+        self.assertFalse(ok)
+        self.assertIn("重复", reason)
+
+
+    def test_renew_after_expiry_resets_without_bonus(self):
+        token = self.issue(typ="timed", days=7)
+        self.assertTrue(self.activate(token)[0])
+        self.advance(8 * 86400)
         newer = keygen.renew("A001", 30 * 86400)
         ok, _, reason = self.activate(newer)
         self.assertTrue(ok, reason)
-        self.assertEqual(state_store.load_state()["activated_at"], BASE_TIME + 3 * 86400)
+        state = state_store.load_state()
+        self.assertEqual(state["activated_at"], BASE_TIME + 8 * 86400)
+        self.assertEqual(state.get("bonus_seconds", 0), 0)
+
 
     def test_check_license_uses_stored_token(self):
         token = self.issue()
@@ -150,6 +192,16 @@ class TestActivation(LicensingTestCase):
 
 
 class TestRevocation(LicensingTestCase):
+    def test_revocation_by_machine_code_ignores_stored_order(self):
+        token = self.issue()
+        self.assertTrue(self.activate(token)[0])
+        machine = fingerprint.machine_code()
+        self.assertNotEqual(state_store.load_state()["order"], machine)
+        revoke, _ = keygen.make_revocation(machine, "取消授权")
+        ok, _, reason = license_core.apply_revocation(revoke)
+        self.assertTrue(ok, reason)
+        self.assertFalse(license_core.check_license()[0])
+
     def test_revocation_matching_order(self):
         token = self.issue(order="A001")
         self.assertTrue(self.activate(token)[0])
